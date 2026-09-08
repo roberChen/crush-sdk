@@ -3,7 +3,6 @@ package imwrap
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +14,9 @@ import (
 // now indirection keeps file timestamp generation stub-friendly.
 var now = time.Now
 
-// HandleMessage processes one incoming IM message: it parses the
+// HandleMessage processes one incoming IM message: it first drops
+// the bot's own output (message-ID marks, Config.SelfAccount, or the
+// content echo filter for shared-account setups), then parses the
 // text, routes commands (builtins and registered custom commands
 // share one namespace), routes pending-question answers, and starts
 // an agent turn for anything else.
@@ -27,6 +28,10 @@ var now = time.Now
 // completes. Hosts should call it from one goroutine per chat (or
 // sequentially) to keep per-chat ordering.
 func (w *Wrapper) HandleMessage(ctx context.Context, msg IMMessage) error {
+	if w.isSelfMessage(msg) {
+		w.log.Debug("imwrap: dropping self output", "chat", msg.ChatID, "id", msg.ID)
+		return nil
+	}
 	p := Parse(w.cfg.CommandPrefix, msg.Text)
 	switch p.Kind {
 	case KindIgnore:
@@ -49,13 +54,63 @@ func (w *Wrapper) HandleMessage(ctx context.Context, msg IMMessage) error {
 	}
 }
 
+// isSelfMessage reports whether an incoming IM message is the bot's
+// own output rather than user input.
+func (w *Wrapper) isSelfMessage(msg IMMessage) bool {
+	if w.cfg.DisableEchoFilter {
+		return false
+	}
+	if msg.FromSelf {
+		return true
+	}
+	if w.cfg.SelfAccount != "" && msg.Sender == w.cfg.SelfAccount {
+		return true
+	}
+	if w.cfg.EchoWindow < 0 {
+		// Content echo matching disabled; IDs and sender still apply.
+		return w.echo.matchIDOnly(msg.ChatID, msg.ID)
+	}
+	return w.echo.match(msg.ChatID, msg.ID, msg.Text, msg.SentAt)
+}
+
+// MarkSelfMessage records the IM-side message ID of a message the
+// bot itself sent (the send path records texts automatically; hosts
+// that know the resulting message ID should also mark it for exact
+// filtering). It is the most reliable self-output filter.
+func (w *Wrapper) MarkSelfMessage(chatID, messageID string) {
+	w.echo.markID(chatID, messageID)
+}
+
+// IsSelfOutput reports whether an incoming message would be treated
+// as the bot's own output under the current filters. Hosts can use it
+// for their own bookkeeping.
+func (w *Wrapper) IsSelfOutput(msg IMMessage) bool {
+	return w.isSelfMessage(msg)
+}
+
+// sendText sends a text through the adapter and records it for echo
+// filtering. All wrapper output goes through here.
+func (w *Wrapper) sendText(ctx context.Context, chatID, text string) error {
+	err := w.adapter.SendText(ctx, chatID, text)
+	if err == nil {
+		w.echo.record(chatID, text)
+	}
+	return err
+}
+
+// sendFile sends a file through the adapter. Filenames are recorded
+// for potential echo matching; file bodies are not.
+func (w *Wrapper) sendFile(ctx context.Context, chatID, filename string, content []byte) error {
+	return w.adapter.SendFile(ctx, chatID, filename, content)
+}
+
 // notifyError reports an error to a chat and returns it.
 func (w *Wrapper) notifyError(chatID, what string, err error) error {
-	slog.Error("imwrap: "+what, "chat", chatID, "error", err)
+	w.log.Error("imwrap: "+what, "chat", chatID, "error", err)
 	if ctx, cerr := w.runCtx(); cerr == nil {
 		text := "⚠ " + what + ": " + err.Error()
-		if sendErr := w.adapter.SendText(ctx, chatID, text); sendErr != nil {
-			slog.Error("imwrap: failed to deliver error notice", "chat", chatID, "error", sendErr)
+		if sendErr := w.sendText(ctx, chatID, text); sendErr != nil {
+			w.log.Error("imwrap: failed to deliver error notice", "chat", chatID, "error", sendErr)
 		}
 	}
 	return err
@@ -86,7 +141,7 @@ func (w *Wrapper) ensureSession(ctx context.Context, chatID string) (sessionID, 
 		return "", "", fmt.Errorf("failed to create session: %w", cerr)
 	}
 	if serr := w.client.SetCurrentSession(ctx, wsID, sess.ID); serr != nil {
-		slog.Debug("imwrap: SetCurrentSession failed", "error", serr)
+		w.log.Debug("imwrap: SetCurrentSession failed", "error", serr)
 	}
 	w.mu.Lock()
 	st = w.state(chatID)
@@ -135,7 +190,7 @@ func (w *Wrapper) startAgentTurn(ctx context.Context, chatID, prompt string) err
 		st.queued = append(st.queued, prompt)
 		pos := len(st.queued)
 		w.mu.Unlock()
-		return w.adapter.SendText(ctx, chatID, fmt.Sprintf("⏳ 正在处理上一条消息，已加入队列（第 %d 位）。/cancel 可中止当前任务。", pos))
+		return w.sendText(ctx, chatID, fmt.Sprintf("⏳ 正在处理上一条消息，已加入队列（第 %d 位）。/cancel 可中止当前任务。", pos))
 	}
 	// Tentatively claim the busy slot so concurrent senders cannot
 	// interleave; rolled back below on failure.
@@ -181,8 +236,8 @@ func (w *Wrapper) ackRun(ctx context.Context, chatID string, run *runState) erro
 	} else if !run.attached {
 		ack = fmt.Sprintf("📨 已发送到会话 %s（当前会话绑定不变，/cancel 取消）", shortID(run.sessionID))
 	}
-	if serr := w.adapter.SendText(ctx, chatID, ack); serr != nil {
-		slog.Warn("imwrap: failed to send acknowledgement", "chat", chatID, "error", serr)
+	if serr := w.sendText(ctx, chatID, ack); serr != nil {
+		w.log.Warn("imwrap: failed to send acknowledgement", "chat", chatID, "error", serr)
 	}
 	return nil
 }
@@ -345,7 +400,7 @@ func (w *Wrapper) restoreModel(ctx context.Context, run *runState) {
 		return
 	}
 	if err := w.client.UpdatePreferredModel(ctx, run.wsID, config.ScopeWorkspace, config.SelectedModelTypeLarge, run.prevModel); err != nil {
-		slog.Error("imwrap: failed to restore previous model", "workspace", run.wsID, "error", err)
+		w.log.Error("imwrap: failed to restore previous model", "workspace", run.wsID, "error", err)
 	}
 }
 
@@ -417,7 +472,7 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 
 		name := fmt.Sprintf("crush-reply-%s.html", timestampSlug(now()))
 		html := RenderTurnHTML(prompt, msgs, &rc, WithSubAgents(subs))
-		if err := w.adapter.SendFile(ctx, chatID, name, html); err != nil {
+		if err := w.sendFile(ctx, chatID, name, html); err != nil {
 			w.notifyError(chatID, "failed to send reply file", err)
 		}
 
@@ -428,8 +483,8 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 		if rc.Error != "" {
 			notice = "⚠ 本轮执行出错: " + truncate(rc.Error, 300)
 		}
-		if err := w.adapter.SendText(ctx, chatID, notice); err != nil {
-			slog.Error("imwrap: failed to send turn summary", "chat", chatID, "error", err)
+		if err := w.sendText(ctx, chatID, notice); err != nil {
+			w.log.Error("imwrap: failed to send turn summary", "chat", chatID, "error", err)
 		}
 
 		w.restoreModel(ctx, run)

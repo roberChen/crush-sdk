@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,7 +20,7 @@ func (w *Wrapper) onQuestionRequest(wsID string, req proto.QuestionRequest) {
 	chatID := w.chatForSession(req.SessionID)
 	if chatID == "" {
 		w.mu.Unlock()
-		slog.Debug("imwrap: question for untracked session", "session", req.SessionID)
+		w.log.Debug("imwrap: question for untracked session", "session", req.SessionID)
 		return
 	}
 	st := w.state(chatID)
@@ -41,11 +40,11 @@ func (w *Wrapper) onQuestionRequest(wsID string, req proto.QuestionRequest) {
 		}
 		if len(progress) > 0 {
 			name := fmt.Sprintf("crush-question-%s.html", timestampSlug(now()))
-			if err := w.adapter.SendFile(ctx, chatID, name, RenderTurnHTML(prompt, progress, nil)); err != nil {
+			if err := w.sendFile(ctx, chatID, name, RenderTurnHTML(prompt, progress, nil)); err != nil {
 				w.notifyError(chatID, "failed to send question context file", err)
 			}
 		}
-		if err := w.adapter.SendText(ctx, chatID, FormatQuestionText(req)); err != nil {
+		if err := w.sendText(ctx, chatID, FormatQuestionText(req)); err != nil {
 			w.notifyError(chatID, "failed to send question", err)
 		}
 	})
@@ -112,13 +111,13 @@ func (w *Wrapper) answerQuestion(ctx context.Context, chatID string, q *pendingQ
 	answer, err := BuildQuestionAnswer(q.req, reply)
 	if err != nil {
 		help := "无法解析回答: " + err.Error() + "\n" + FormatQuestionText(q.req)
-		return w.adapter.SendText(ctx, chatID, help)
+		return w.sendText(ctx, chatID, help)
 	}
 	if _, err := w.client.AnswerQuestionBatch(ctx, q.wsID, answer); err != nil {
 		return fmt.Errorf("failed to submit question answer: %w", err)
 	}
 	w.clearPendingQuestion(chatID)
-	return w.adapter.SendText(ctx, chatID, "✔ 已提交回答，继续执行…")
+	return w.sendText(ctx, chatID, "✔ 已提交回答，继续执行…")
 }
 
 // FormatQuestionText renders a question batch as an IM-friendly text

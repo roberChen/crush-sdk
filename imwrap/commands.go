@@ -42,18 +42,19 @@ type CommandContext struct {
 	// ArgText is the raw argument text (preserves inner spacing).
 	ArgText string
 	// SessionID is the chat's current session, or "" when the chat
-	// has no session yet. Use W.EnsureSession to create one.
+	// has no session yet. Use W.CreateSession to create and bind one
+	// (an empty session is also created lazily by the next prompt).
 	SessionID string
 }
 
 // Reply sends a text message to the originating chat.
 func (c CommandContext) Reply(ctx context.Context, text string) error {
-	return c.W.adapter.SendText(ctx, c.ChatID, text)
+	return c.W.sendText(ctx, c.ChatID, text)
 }
 
 // ReplyFile sends a file to the originating chat.
 func (c CommandContext) ReplyFile(ctx context.Context, filename string, content []byte) error {
-	return c.W.adapter.SendFile(ctx, c.ChatID, filename, content)
+	return c.W.sendFile(ctx, c.ChatID, filename, content)
 }
 
 // CommandInfo describes a registered command.
@@ -135,7 +136,7 @@ func (w *Wrapper) runCommand(ctx context.Context, chatID string, p Parsed) error
 	}
 	w.mu.Unlock()
 	if !ok {
-		return w.adapter.SendText(ctx, chatID, "未知命令 /"+p.Name+"。可用命令：\n"+w.commandHelp())
+		return w.sendText(ctx, chatID, "未知命令 /"+p.Name+"。可用命令：\n"+w.commandHelp())
 	}
 	return cmd.fn(ctx, CommandContext{
 		W:         w,
@@ -167,7 +168,7 @@ func registerBuiltinCommands(w *Wrapper) {
 		fn   CommandFunc
 	}{
 		{"help", "显示可用命令", []string{"?"}, cmdHelp},
-		{"sessions", "列出全部会话（跨目录）", []string{"ls"}, cmdSessions},
+		{"sessions", "列出全部会话为 HTML（可搜索，/sessions [关键词]）", []string{"ls"}, cmdSessions},
 		{"switch", "切换会话 (/switch <序号|会话ID前缀>)", nil, cmdSwitch},
 		{"new", "新建会话 (/new [-d 目录] [标题])", nil, cmdNew},
 		{"info", "查看当前会话信息（目录/技能/工具/上下文水位）", nil, cmdInfo},
@@ -176,6 +177,7 @@ func registerBuiltinCommands(w *Wrapper) {
 		{"models", "列出可用模型", nil, cmdModels},
 		{"model", "查看或设置当前模型 (/model [provider/model])", nil, cmdModel},
 		{"export", "导出当前会话完整记录为 HTML 文件", nil, cmdExport},
+		{"summarize", "手动压缩当前会话（生成摘要释放上下文）", nil, cmdSummarize},
 		{"status", "查看当前会话与任务状态", nil, cmdStatus},
 		{"cancel", "取消当前问题或正在执行的任务", nil, cmdCancel},
 	}
@@ -224,30 +226,27 @@ func (w *Wrapper) listAllSessions(ctx context.Context) ([]sessionEntry, error) {
 }
 
 func cmdSessions(ctx context.Context, c CommandContext) error {
-	entries, err := c.W.listAllSessions(ctx)
+	keyword := strings.TrimSpace(c.ArgText)
+	summaries, err := c.W.SessionSummaries(ctx, c.ChatID, keyword)
 	if err != nil {
 		return err
 	}
-	currentWS := c.W.chatWorkspace(c.ChatID)
-	var b strings.Builder
-	fmt.Fprintf(&b, "共 %d 个会话（用序号 /switch 切换）：\n", len(entries))
-	for i, e := range entries {
-		marker := "  "
-		if e.sess.ID == c.SessionID && e.wsID == currentWS {
-			marker = "▶ "
+	if len(summaries) == 0 {
+		if keyword != "" {
+			return c.Reply(ctx, "没有匹配 "+keyword+" 的会话。")
 		}
-		busy := ""
-		if e.sess.IsBusy {
-			busy = " [busy]"
-		}
-		title := e.sess.Title
-		if title == "" {
-			title = "(无标题)"
-		}
-		fmt.Fprintf(&b, "%s%d. %s  %s (%d msgs)%s @ %s\n",
-			marker, i+1, shortID(e.sess.ID), title, e.sess.MessageCount, busy, e.path)
+		return c.Reply(ctx, "当前没有任何会话。")
 	}
-	return c.Reply(ctx, b.String())
+
+	name := fmt.Sprintf("crush-sessions-%s.html", timestampSlug(now()))
+	if err := c.ReplyFile(ctx, name, RenderSessionsHTML(summaries, keyword)); err != nil {
+		return err
+	}
+	total := len(summaries)
+	if keyword != "" {
+		return c.Reply(ctx, fmt.Sprintf("📋 关键词 %s 匹配 %d 个会话，详见 HTML 文件（文件内可继续搜索；序号可用于 /switch）。", keyword, total))
+	}
+	return c.Reply(ctx, fmt.Sprintf("📋 共 %d 个会话，详见 HTML 文件（文件内可搜索；序号可用于 /switch）。", total))
 }
 
 func cmdSwitch(ctx context.Context, c CommandContext) error {
@@ -466,18 +465,36 @@ func (w *Wrapper) ExportSessionHTML(ctx context.Context, chatID string) error {
 		sess = s
 	}
 	name := fmt.Sprintf("crush-session-%s-export-%s.html", shortID(sessionID), timestampSlug(now()))
-	if err := w.adapter.SendFile(ctx, chatID, name, RenderSessionHTML(sess, msgs)); err != nil {
+	if err := w.sendFile(ctx, chatID, name, RenderSessionHTML(sess, msgs)); err != nil {
 		return err
 	}
 	title := ""
 	if sess != nil {
 		title = sess.Title
 	}
-	return w.adapter.SendText(ctx, chatID, fmt.Sprintf("📦 已导出会话 %s（%s）共 %d 条消息。", shortID(sessionID), title, len(msgs)))
+	return w.sendText(ctx, chatID, fmt.Sprintf("📦 已导出会话 %s（%s）共 %d 条消息。", shortID(sessionID), title, len(msgs)))
 }
 
 func cmdExport(ctx context.Context, c CommandContext) error {
 	return c.W.ExportSessionHTML(ctx, c.ChatID)
+}
+
+// SummarizeSession requests a manual summarization of the chat's
+// current session, like the TUI's summarize action: the server
+// generates a summary message so the context window is released.
+func (w *Wrapper) SummarizeSession(ctx context.Context, chatID string) error {
+	sessionID, wsID, err := w.ensureSession(ctx, chatID)
+	if err != nil {
+		return err
+	}
+	if err := w.client.AgentSummarizeSession(ctx, wsID, sessionID); err != nil {
+		return fmt.Errorf("failed to summarize session: %w", err)
+	}
+	return w.sendText(ctx, chatID, "🗂 已请求压缩会话 "+shortID(sessionID)+"，摘要生成后会作为 summary 消息出现。")
+}
+
+func cmdSummarize(ctx context.Context, c CommandContext) error {
+	return c.W.SummarizeSession(ctx, c.ChatID)
 }
 
 func cmdStatus(ctx context.Context, c CommandContext) error {

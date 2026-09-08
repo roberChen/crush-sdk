@@ -88,6 +88,7 @@ type fakeServer struct {
 	modelSets   []recordedModelSet
 	cancels     int
 	agentCancel int
+	summarized  []string // wsID/sid pairs
 
 	push chan string
 	srv  *httptest.Server
@@ -160,6 +161,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("POST /v1/workspaces/{id}/agent", f.sendAgent)
 	mux.HandleFunc("GET /v1/workspaces/{id}/agent", f.getAgent)
 	mux.HandleFunc("POST /v1/workspaces/{id}/agent/sessions/{sid}/cancel", f.cancelAgent)
+	mux.HandleFunc("POST /v1/workspaces/{id}/agent/sessions/{sid}/summarize", f.summarizeSession)
 	mux.HandleFunc("POST /v1/workspaces/{id}/permissions/grant", f.grant)
 	mux.HandleFunc("POST /v1/workspaces/{id}/questions/answer", f.answer)
 	mux.HandleFunc("POST /v1/workspaces/{id}/questions/cancel", f.cancelQuestion)
@@ -327,6 +329,13 @@ func (f *fakeServer) getAgent(w http.ResponseWriter, r *http.Request) {
 func (f *fakeServer) cancelAgent(w http.ResponseWriter, _ *http.Request) {
 	f.mu.Lock()
 	f.agentCancel++
+	f.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (f *fakeServer) summarizeSession(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.summarized = append(f.summarized, r.PathValue("id")+"/"+r.PathValue("sid"))
 	f.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }

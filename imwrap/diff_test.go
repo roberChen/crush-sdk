@@ -148,8 +148,8 @@ func TestRenderSubAgentToolCallWithTranscript(t *testing.T) {
 	require.Contains(t, html, "todo1")
 	require.Contains(t, html, "sub agent final words")
 
-	// The outer result (输出) is rendered by the tool-result part.
-	require.Contains(t, html, "📤 task")
+	// The outer result (输出) renders inside the sub-agent block.
+	require.Contains(t, html, "📤 输出")
 	require.Contains(t, html, "scan finished: 3 issues")
 }
 

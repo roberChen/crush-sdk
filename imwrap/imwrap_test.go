@@ -238,13 +238,19 @@ func TestSessionLifecycleCommands(t *testing.T) {
 	f.sessions["ws1"]["sess-1"].UpdatedAt = 5
 	f.mu.Unlock()
 
-	// /sessions lists both, current one marked.
+	// /sessions renders an HTML file with a search box; the current
+	// session is marked in the status column.
 	require.NoError(t, w.HandleMessage(ctx, IMMessage{ChatID: "c", Text: "/sessions"}))
-	texts, _ = ad.snapshot()
+	texts, files := ad.snapshot()
 	require.Len(t, texts, 2)
-	require.Contains(t, texts[1], "sess-1")
-	require.Contains(t, texts[1], "sess-2")
-	require.Contains(t, texts[1], "▶")
+	require.Contains(t, texts[1], "共 2 个会话")
+	require.Len(t, files, 1)
+	require.Contains(t, files[0].filename, "crush-sessions-")
+	require.Contains(t, files[0].content, "sess-1")
+	require.Contains(t, files[0].content, "sess-2")
+	require.Contains(t, files[0].content, "▶当前")
+	require.Contains(t, files[0].content, `id="q"`)
+	require.Contains(t, files[0].content, "data-search")
 
 	// /switch by index (most recently updated first: sess-1, sess-2).
 	require.NoError(t, w.HandleMessage(ctx, IMMessage{ChatID: "c", Text: "/switch 2"}))

@@ -4,7 +4,12 @@
 // cliAdapter method bodies with the real CLI invocations and the
 // polling loop with the IM's webhook or long-poll mechanism.
 //
-// Usage: go run ./examples/imhost [-path /project/dir]
+// The host only provides the IM adapter (and optional custom
+// commands); session management, permissions, reports, question
+// flows, model switching, and self-output filtering are handled by
+// the wrapper.
+//
+// Usage: go run ./examples/imhost [-config imwrap.json] [-path /project/dir]
 package main
 
 import (
@@ -12,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,11 +55,13 @@ func (cliAdapter) FetchHistory(ctx context.Context, chatID string, limit int) ([
 	}
 	var msgs []imwrap.IMMessage
 	for line := range strings.SplitSeq(out, "\n") {
-		sender, text, ok := strings.Cut(line, ":")
+		// Lines look like "id|sender:text".
+		head, text, ok := strings.Cut(line, ":")
 		if !ok {
 			continue
 		}
-		msgs = append(msgs, imwrap.IMMessage{ChatID: chatID, Sender: sender, Text: text})
+		id, sender, _ := strings.Cut(head, "|")
+		msgs = append(msgs, imwrap.IMMessage{ChatID: chatID, ID: id, Sender: sender, Text: text})
 	}
 	return msgs, nil
 }
@@ -83,21 +91,39 @@ func writeTemp(filename string, content []byte) (string, error) {
 }
 
 func main() {
+	configPath := flag.String("config", "", "imwrap JSON config file (optional)")
 	path := flag.String("path", ".", "workspace filesystem path")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	c, err := client.DefaultClient(*path)
-	if err != nil {
-		log.Fatalf("dial: %v", err)
+	// Framework-owned logging: configure once here and use
+	// imwrap.Logger() everywhere else in the host program.
+	imwrap.SetLogLevel(slog.LevelInfo)
+	hostLog := imwrap.Logger()
+
+	// Options come from the config file when present; Client and
+	// Adapter are always provided by the host program.
+	cfg := imwrap.Config{}
+	if *configPath != "" {
+		fileCfg, err := imwrap.LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		fileCfg.Apply(&cfg)
+		hostLog.Info("loaded config", "path", *configPath)
+	}
+	cfg.Adapter = cliAdapter{}
+	if cfg.Client == nil {
+		c, err := client.DefaultClient(*path)
+		if err != nil {
+			log.Fatalf("dial: %v", err)
+		}
+		cfg.Client = c
 	}
 
-	w, err := imwrap.New(imwrap.Config{
-		Client:  c,
-		Adapter: cliAdapter{},
-	})
+	w, err := imwrap.New(cfg)
 	if err != nil {
 		log.Fatalf("wrapper: %v", err)
 	}
@@ -114,25 +140,29 @@ func main() {
 	}
 
 	// Poll conversation history and feed new messages to the
-	// wrapper. Replace with a webhook push if the IM supports one.
-	seen := make(map[string]bool)
+	// wrapper. The wrapper itself filters the bot's own output
+	// (by message ID, sender account, or content echo), so this
+	// loop can feed everything it sees. Replace with a webhook
+	// push if the IM supports one.
 	history, ok := w.Adapter().(imwrap.HistoryFetcher)
 	if !ok {
 		log.Fatal("adapter does not support history")
 	}
+	seen := make(map[string]bool)
 	for {
 		msgs, err := history.FetchHistory(ctx, "default-chat", 20)
 		if err != nil {
-			log.Printf("history: %v", err)
+			hostLog.Error("history failed", "error", err)
 		}
 		for _, m := range msgs {
-			key := m.Sender + "|" + m.Text
-			if seen[key] {
-				continue
+			if m.ID != "" {
+				if seen[m.ID] {
+					continue
+				}
+				seen[m.ID] = true
 			}
-			seen[key] = true
 			if err := w.HandleMessage(ctx, m); err != nil {
-				log.Printf("handle: %v", err)
+				hostLog.Error("handle failed", "error", err)
 			}
 		}
 		time.Sleep(2 * time.Second)

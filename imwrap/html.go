@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -26,10 +25,13 @@ type SubAgentTranscript struct {
 	Messages []proto.Message
 }
 
-// turnRenderCtx carries per-render state; the zero value renders
-// without sub-agent transcripts.
+// turnRenderCtx carries per-render state. The zero value renders
+// without sub-agent transcripts; renderMessages fills the result
+// index so each tool call renders next to its matching result.
 type turnRenderCtx struct {
-	subs []SubAgentTranscript
+	subs    []SubAgentTranscript
+	results map[string]proto.ToolResult
+	shown   map[string]bool // toolCallID -> result rendered with its call
 }
 
 // TurnHTMLOption customizes [RenderTurnHTML].
@@ -101,6 +103,10 @@ func sessionSubtitle(sess *proto.Session) string {
 
 // renderMessages writes the message list body.
 func renderMessages(b *strings.Builder, msgs []proto.Message, ctx *turnRenderCtx) {
+	if ctx.results == nil {
+		ctx.results = indexToolResults(msgs)
+		ctx.shown = make(map[string]bool)
+	}
 	b.WriteString("<main>")
 	if len(msgs) == 0 {
 		b.WriteString("<p class=\"sub\">(no messages)</p>")
@@ -109,6 +115,19 @@ func renderMessages(b *strings.Builder, msgs []proto.Message, ctx *turnRenderCtx
 		renderMessage(b, &msgs[i], ctx)
 	}
 	b.WriteString("</main>")
+}
+
+// indexToolResults maps toolCallID -> latest result across messages.
+func indexToolResults(msgs []proto.Message) map[string]proto.ToolResult {
+	out := make(map[string]proto.ToolResult)
+	for i := range msgs {
+		for _, tr := range msgs[i].ToolResults() {
+			if tr.ToolCallID != "" {
+				out[tr.ToolCallID] = tr
+			}
+		}
+	}
+	return out
 }
 
 func renderMessage(b *strings.Builder, m *proto.Message, ctx *turnRenderCtx) {
@@ -141,13 +160,22 @@ func renderMessage(b *strings.Builder, m *proto.Message, ctx *turnRenderCtx) {
 		case proto.ToolCall:
 			renderToolCall(b, p, ctx)
 		case proto.ToolResult:
+			if ctx != nil && ctx.shown[p.ToolCallID] {
+				// Already rendered together with its tool call.
+				continue
+			}
+			if ctx != nil {
+				ctx.shown[p.ToolCallID] = true
+			}
 			cls := "toolresult"
 			summary := "📤 " + p.Name
 			if p.IsError {
 				cls += " failed"
 				summary += " (error)"
 			}
-			fmt.Fprintf(b, "<details class=\"%s\"><summary>%s</summary><pre class=\"code\">%s</pre></details>", cls, esc(summary), esc(truncate(p.Content, maxResultDisplay)))
+			fmt.Fprintf(b, "<details class=\"%s\"><summary>%s</summary>", cls, esc(summary))
+			renderResultBody(b, "结果", p)
+			b.WriteString("</details>")
 		case proto.Finish:
 			note := "finished: " + string(p.Reason)
 			if p.Message != "" {
@@ -177,19 +205,62 @@ var (
 // renderToolCall renders a tool call with the best view for its
 // family: colored diffs for edit/write/multiedit, input plus a
 // nested sub-agent transcript for task/agent, and re-indented JSON
-// for everything else.
+// for everything else. The call's matching tool result (by
+// tool_call_id) is rendered inside the same block.
 func renderToolCall(b *strings.Builder, p proto.ToolCall, ctx *turnRenderCtx) {
 	input := parseToolInput(p.Input)
 	switch {
 	case editToolNames[p.Name]:
-		renderEditToolCall(b, p.Name, input)
+		renderEditToolCall(b, p, input, ctx)
 	case p.Name == "multiedit":
-		renderMultiEditToolCall(b, input)
+		renderMultiEditToolCall(b, p, input, ctx)
 	case subAgentToolNames[p.Name]:
 		renderSubAgentToolCall(b, p, ctx)
 	default:
-		fmt.Fprintf(b, "<details class=\"toolcall\"><summary>🔧 %s</summary><pre class=\"code\">%s</pre></details>", esc(p.Name), esc(prettyJSON(p.Input)))
+		fmt.Fprintf(b, "<details class=\"toolcall\"><summary>🔧 %s</summary><pre class=\"code\">%s</pre>", esc(p.Name), esc(prettyJSON(p.Input)))
+		attachToolResult(b, p.ID, resultLabel(p.Name), ctx)
+		b.WriteString("</details>")
 	}
+}
+
+// resultLabel labels the attached result block; sub-agent calls show
+// their final answer as 输出.
+func resultLabel(toolName string) string {
+	if subAgentToolNames[toolName] {
+		return "输出"
+	}
+	return "结果"
+}
+
+// attachToolResult renders the call's tool result, if any, marking it
+// shown so the standalone tool-message rendering skips it.
+func attachToolResult(b *strings.Builder, toolCallID, label string, ctx *turnRenderCtx) {
+	if ctx == nil || toolCallID == "" {
+		return
+	}
+	res, ok := ctx.results[toolCallID]
+	if !ok {
+		return
+	}
+	ctx.shown[toolCallID] = true
+	renderResultBody(b, label, res)
+}
+
+// renderResultBody writes a labeled result block (status, content).
+func renderResultBody(b *strings.Builder, label string, res proto.ToolResult) {
+	head := label
+	if res.IsError {
+		head += "（出错）"
+	}
+	fmt.Fprintf(b, "<div class=\"hunk-head result-head%s\">📤 %s</div>", resultClass(res.IsError), esc(head))
+	fmt.Fprintf(b, "<pre class=\"code\">%s</pre>", esc(truncate(res.Content, maxResultDisplay)))
+}
+
+func resultClass(isError bool) string {
+	if isError {
+		return " failed"
+	}
+	return ""
 }
 
 // parseToolInput decodes a tool call's raw JSON input leniently.
@@ -221,8 +292,8 @@ func inputString(m map[string]any, keys ...string) string {
 }
 
 // renderEditToolCall renders edit/write as a colored diff between
-// old and new content.
-func renderEditToolCall(b *strings.Builder, name string, input map[string]any) {
+// old and new content, with the call's result attached.
+func renderEditToolCall(b *strings.Builder, p proto.ToolCall, input map[string]any, ctx *turnRenderCtx) {
 	filePath := inputString(input, "file_path", "filePath", "path")
 	oldText := inputString(input, "old_string", "old_content")
 	newText := inputString(input, "new_string", "new_content")
@@ -235,14 +306,15 @@ func renderEditToolCall(b *strings.Builder, name string, input map[string]any) {
 		kind = "（清空文件）"
 	}
 	fmt.Fprintf(b, "<details class=\"toolcall editdiff\"><summary>✏️ %s %s%s</summary>",
-		esc(name), esc(filePath), esc(kind))
+		esc(p.Name), esc(filePath), esc(kind))
 	renderDiffHTML(b, oldText, newText)
+	attachToolResult(b, p.ID, resultLabel(p.Name), ctx)
 	b.WriteString("</details>")
 }
 
 // renderMultiEditToolCall renders each edit of a multiedit call as
-// its own diff hunk.
-func renderMultiEditToolCall(b *strings.Builder, input map[string]any) {
+// its own diff hunk, with the call's result attached.
+func renderMultiEditToolCall(b *strings.Builder, p proto.ToolCall, input map[string]any, ctx *turnRenderCtx) {
 	filePath := inputString(input, "file_path", "filePath", "path")
 	rawEdits, _ := input["edits"].([]any)
 
@@ -258,6 +330,7 @@ func renderMultiEditToolCall(b *strings.Builder, input map[string]any) {
 			inputString(edit, "old_string", "old_content"),
 			inputString(edit, "new_string", "new_content"))
 	}
+	attachToolResult(b, p.ID, resultLabel(p.Name), ctx)
 	b.WriteString("</details>")
 }
 
@@ -293,6 +366,7 @@ func renderSubAgentToolCall(b *strings.Builder, p proto.ToolCall, ctx *turnRende
 	} else {
 		b.WriteString("<p class=\"sub\">（子会话消息不可用）</p>")
 	}
+	attachToolResult(b, p.ID, resultLabel(p.Name), ctx)
 	b.WriteString("</details>")
 }
 
@@ -319,53 +393,6 @@ func firstTurnCreatedAt(msgs []proto.Message) int64 {
 		}
 	}
 	return first
-}
-
-// markdownish renders a small, safe subset of markdown: fenced code
-// blocks, inline code, bold, italics, and http(s) links. The input is
-// HTML-escaped before any markup is applied, so raw HTML never passes
-// through.
-func markdownish(s string) string {
-	chunks := strings.Split(s, "```")
-	var b strings.Builder
-	for i, chunk := range chunks {
-		if i%2 == 1 {
-			fmt.Fprintf(&b, "<pre class=\"code\">%s</pre>", esc(trimEdgeNewlines(chunk)))
-			continue
-		}
-		if i > 0 {
-			// Drop the newline that immediately follows a closing fence
-			// so it does not become a spurious blank line.
-			chunk = strings.TrimPrefix(chunk, "\n")
-		}
-		b.WriteString(inlineMarkdown(chunk))
-	}
-	return b.String()
-}
-
-// trimEdgeNewlines removes at most one leading and one trailing
-// newline from a fenced code block body.
-func trimEdgeNewlines(s string) string {
-	s = strings.TrimPrefix(s, "\n")
-	s = strings.TrimSuffix(s, "\n")
-	return s
-}
-
-var (
-	reInlineCode = regexp.MustCompile("`([^`\n]+)`")
-	reBold       = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
-	reEmph       = regexp.MustCompile(`(^|[^*])\*([^*\n]+)\*`)
-	reLink       = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s]+)\)`)
-)
-
-func inlineMarkdown(s string) string {
-	s = esc(s)
-	s = reLink.ReplaceAllString(s, "<a href=\"$2\" target=\"_blank\" rel=\"noreferrer\">$1</a>")
-	s = reBold.ReplaceAllString(s, "<strong>$1</strong>")
-	s = reEmph.ReplaceAllString(s, "$1<em>$2</em>")
-	s = reInlineCode.ReplaceAllString(s, "<code>$1</code>")
-	s = strings.ReplaceAll(s, "\n", "<br>")
-	return s
 }
 
 // prettyJSON re-indents a JSON tool-call input; non-JSON input is
@@ -470,4 +497,26 @@ table.diff tr.add td { background: #122a19; color: #8ee2a9; }
 .hunk-head { color: #9fb0c8; font-size: 11.5px; margin: 8px 0 2px; }
 .subagent-session { border: 1px dashed #33405a; border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
 .subagent-session > summary { color: #b39ddb; }
+.text h1, .text h2, .text h3, .text h4, .text h5, .text h6 { margin: 12px 0 6px; line-height: 1.3; }
+.text h1 { font-size: 18px; } .text h2 { font-size: 16px; } .text h3 { font-size: 15px; }
+.text h4, .text h5, .text h6 { font-size: 14px; }
+.text p { margin: 6px 0; }
+.text ul, .text ol { margin: 6px 0; padding-left: 22px; }
+.text li { margin: 2px 0; }
+.text blockquote { margin: 6px 0; padding: 2px 12px; border-left: 3px solid #3b465c; color: #a8b2c2; }
+.text hr { border: none; border-top: 1px solid #262b36; margin: 12px 0; }
+.text del { color: #8b93a3; }
+input.search { width: 100%; box-sizing: border-box; padding: 8px 10px; margin: 8px 0;
+  background: #0b0d12; color: #d7dce4; border: 1px solid #2c3340; border-radius: 6px;
+  font: 13px -apple-system, "Segoe UI", Roboto, "PingFang SC", sans-serif; }
+input.search:focus { outline: 1px solid #3b6ea5; }
+table.sessions { border-collapse: collapse; margin: 8px 0; font-size: 12.5px; width: 100%; }
+table.sessions th, table.sessions td { border: 1px solid #2c3340; padding: 4px 8px; text-align: left; }
+table.sessions th { background: #171c26; color: #c7d0dd; font-weight: 600; white-space: nowrap; }
+table.sessions tbody tr:nth-child(odd) td { background: #12151d; }
+table.sessions tr.current td { background: #14202b; }
+table.md { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: 100%; }
+table.md th, table.md td { border: 1px solid #2c3340; padding: 4px 10px; text-align: left; }
+table.md th { background: #171c26; color: #c7d0dd; font-weight: 600; }
+table.md tbody tr:nth-child(odd) td { background: #12151d; }
 `

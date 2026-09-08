@@ -44,7 +44,8 @@ func TestRenderTurnHTMLEscapesAndIncludesParts(t *testing.T) {
 	require.Contains(t, html, `<a href="https://example.com"`)
 	require.Contains(t, html, "🔧 bash")
 	require.Contains(t, html, "&#34;command&#34;: &#34;ls -la&#34;")
-	require.Contains(t, html, "📤 bash")
+	// The result renders together with its call, not standalone.
+	require.Contains(t, html, "📤 结果")
 	require.Contains(t, html, "total 0\n-rw file &amp; &lt;tag&gt;")
 	require.Contains(t, html, "finished: end_turn")
 	require.Contains(t, html, "role-user")
@@ -71,7 +72,7 @@ func TestRenderSessionHTML(t *testing.T) {
 	html := string(RenderSessionHTML(&sess, testMessages()))
 	require.Contains(t, html, "my session")
 	require.Contains(t, html, "3 messages")
-	require.Contains(t, html, "📤 bash")
+	require.Contains(t, html, "📤 结果")
 
 	html = string(RenderSessionHTML(nil, nil))
 	require.Contains(t, html, "(no messages)")

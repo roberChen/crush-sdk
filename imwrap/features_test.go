@@ -300,10 +300,17 @@ func TestCreateSessionWithDirectoryAndInfo(t *testing.T) {
 	require.Equal(t, otherWS, last.wsID)
 	require.Equal(t, "sess-1", last.msg.SessionID)
 
-	// /sessions lists sessions from both workspaces with their dirs.
+	// /sessions lists sessions from both workspaces in an HTML file.
 	require.NoError(t, w.HandleMessage(ctx, IMMessage{ChatID: "c", Text: "/sessions"}))
-	texts, _ = ad.snapshot()
-	require.Contains(t, texts[3], "@ "+otherDir)
+	texts, sfiles := ad.snapshot()
+	require.Contains(t, texts[3], "共 1 个会话")
+	require.Len(t, sfiles, 1)
+	require.Contains(t, sfiles[0].content, otherDir)
+	// /sessions with a keyword filters server-side.
+	require.NoError(t, w.HandleMessage(ctx, IMMessage{ChatID: "c", Text: "/sessions side"}))
+	texts, sfiles = ad.snapshot()
+	require.Contains(t, texts[4], "匹配 1 个会话")
+	require.Contains(t, sfiles[1].content, "关键词 side")
 
 	// /ask -d runs a one-shot in the default workspace's directory.
 	require.NoError(t, w.HandleMessage(ctx, IMMessage{ChatID: "c", Text: "/ask -d " + t.TempDir() + " quick"}))

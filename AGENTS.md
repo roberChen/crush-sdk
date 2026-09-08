@@ -144,15 +144,21 @@ places carry explicit sync obligations — respect them when changing types:
 
 ## imwrap package
 
-`imwrap` is original code (not extracted from upstream): a chat wrapper over
-`Client` for IM integrations. Key invariants:
+`imwrap` is original code (not extracted from upstream): a chat framework over
+`Client` for IM integrations. Hosts provide `IMAdapter` plus custom commands;
+everything else is framework-owned. Key invariants:
 
-- The host program implements `IMAdapter` (SendText/SendFile, optional
-  `HistoryFetcher`) and feeds messages to `Wrapper.HandleMessage`.
-- Multi-workspace: sessions can live in other directories (`/new -d`,
-  `AskOptions.Dir`); `workspaceFor` resolves/creates a workspace per absolute
-  path and `ensureLoop` runs one SSE event loop per workspace. Event handlers
-  receive the originating wsID (permissions/questions are workspace-scoped).
+- Self-output filtering runs first in `HandleMessage` (message-ID marks,
+  `Config.SelfAccount`, then content echo via `echoTracker`; all wrapper sends
+  go through `sendText` so they are recorded). `SentAt` guards content matches
+  against pre-recording user messages. `DisableEchoFilter` bypasses everything.
+- Logging is framework-managed (`log.go`): the wrapper uses `w.log`
+  (Config.Logger or the package logger); hosts use `imwrap.Logger()`.
+- Server autostart (`server.go`) is opt-in (`Config.StartServer`): Health is
+  probed first; a `crush server` child is spawned only when unreachable, its
+  output piped into the wrapper logger, and `Stop()` kills it.
+- File config (`config.go`): `FileConfig` (JSON) -> `Apply(&Config)`; it never
+  provides Client/Adapter, only options. Unknown log levels fall back to info.
 - Turn correlation uses a fresh RunID per `SendMessage`; runs are tracked in
   `Wrapper.runs` keyed by RunID (`runState`). Attached runs own the chat's
   busy/queue slots; detached runs (`/ask` one-shots, `/say`) never touch the
@@ -160,26 +166,33 @@ places carry explicit sync obligations — respect them when changing types:
   `Wrapper.mu`. Sub-agent (`task`/`agent` tool) sessions are never bound to a
   chat; their transcripts are only fetched (ListSessions by ParentSessionID,
   filtered by turn start time) to nest inside the HTML report.
+- Multi-workspace: sessions can live in other directories (`/new -d`,
+  `AskOptions.Dir`); `workspaceFor` resolves/creates a workspace per absolute
+  path and `ensureLoop` runs one SSE event loop per workspace. Event handlers
+  receive the originating wsID (permissions/questions are workspace-scoped).
 - Config bools are opt-out (`DisableYOLO`, `DisableAutoGrant`) because the
   wanted defaults (YOLO on, auto-grant on) are not the zero value.
-- Permission requests are auto-granted on their own goroutine so a slow
-  adapter never blocks the agent; RunComplete/Question handling also
-  dispatches goroutines (via `wg.Go`) since they call the adapter. Every
-  accepted prompt acks immediately through the adapter (`ackRun`).
+- Permission requests are auto-granted on their own goroutine; RunComplete and
+  Question handling also dispatch goroutines (via `wg.Go`). Every accepted
+  prompt acks immediately (`ackRun`).
 - Model overrides in `AskOnce` temporarily change the workspace default model
-  (scope workspace, type large) and restore the previous selection when the
-  run completes or fails; concurrent runs in the same workspace may observe
-  the override (documented caveat).
-- HTML rendering (`html.go` + `diff.go`) is dependency-free: everything is
-  escaped, a small markdown subset (fences, inline code, bold, em, http
-  links) is applied after escaping. Never render unescaped model/tool output.
-  `edit`/`write`/`multiedit` calls render as LCS line diffs (capped at
-  `maxDiffLines`, then block fallback); `task`/`agent` calls render input plus
-  nested child-session transcripts via `WithSubAgents`.
+  (scope workspace, type large) and restore it on completion/failure;
+  concurrent runs in the same workspace may observe the override (documented).
+- HTML rendering (`html.go`, `markdown.go`, `diff.go`) is dependency-free and
+  escape-first: raw HTML never passes through. Markdown covers blocks
+  (headings, tables with alignment, lists, quotes, hr, fences) and inline
+  markup (bold, em, strike, code, links, images-as-links, guarded autolinks).
+  Tool calls render together with their results (indexToolResults by
+  tool_call_id; orphan results still render standalone). `edit`/`write`/
+  `multiedit` render LCS diffs (capped at `maxDiffLines`); `task`/`agent`
+  render input, nested child-session transcript, and labeled 输出. The
+  /sessions listing renders as a self-contained HTML file with an inline
+  client-side search box (`sessionshtml.go`); `/sessions <keyword>` also
+  filters server-side before rendering.
 - Tests use a fake HTTP server (`fakeserver_test.go`) that speaks the /v1
   protocol including a pushable SSE stream, multi-workspace stores, and
-  config/model endpoints; async effects are awaited with `waitFor`. Keep new
-  event-flow logic covered there.
+  config/model/summarize endpoints; async effects are awaited with `waitFor`.
+  Keep new event-flow logic covered there.
 
 ## Testing
 

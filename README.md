@@ -66,46 +66,62 @@ c, err := client.NewClient("/path/to/project", "tcp", "127.0.0.1:8080")
 
 完整示例见 [examples/e2e](examples/e2e)。
 
-## imwrap：IM 软件接入层
+## imwrap：IM 软件接入层（框架）
 
-`imwrap` 包在 `Client` 之上封装了一个面向聊天软件（企业微信、Telegram、
-Slack 等支持 CLI 操作的 IM）的控制器。宿主程序实现 `IMAdapter`
-（发送文字、发送文件，可选实现拉取历史），把收到的每条 IM 消息喂给
-`Wrapper.HandleMessage` 即可：
+`imwrap` 在 `Client` 之上封装成面向聊天软件的**框架**：宿主程序只需要提供
+`IMAdapter`（发送文字、发送文件，可选实现拉取历史）与自定义命令，其余全部
+由框架处理（会话/模型/权限/报告/提问/过滤/日志/配置）。
 
-- 消息解析：`/` 前缀识别为命令，其余文本作为 agent prompt 触发回答
+支持两种对话场景，并能准确区分用户输入与 bot 自己的输出：
+
+- **双账号**（用户与 bot 各自一个账号）：配置 `SelfAccount`，来自 bot 账号
+  的消息直接忽略
+- **共用账号**（bot 以同一账号轮询历史）：三层过滤，按可靠性依次为
+  ① 消息 ID（`IMMessage.ID` + `MarkSelfMessage`）；② 内容回声（框架发出的
+  每条文字都会被记录，回灌时按 chat + 时间窗 + `SentAt` 识别）；
+  ③ `IMMessage.FromSelf` 显式声明
+
+其他框架能力：
+
+- 消息解析：`/` 前缀识别为命令，其余文本作为 agent prompt 触发回答；
+  触发后立刻回复 ack
 - 权限自动放行（YOLO）：workspace 以 YOLO 创建，SSE 权限请求自动 grant
-- 触发对话后立刻回复 ack；每轮回答完成后，把本轮完整信息（thinking、
-  tool call、tool result、正文、finish 原因）渲染为自带样式的 HTML 文件
-  发送，并附一条文字摘要
-- tool call 分类渲染：`edit`/`write`/`multiedit` 渲染为彩色 diff；
-  `task`/`agent`（子 agent，本质是新会话）渲染输入、子会话完整过程
-  （其 toolcall 与输出）和最终输出，且不会切换当前会话绑定
-- agent 调用 question tool 时：先发送当前进度的 HTML 文件，再发一条
-  文字提问；用户的下一条非命令消息会作为答案解析并提交
-  （支持序号、选项文本、yes/no、自由文本）
-- 模型管理：`/models` 罗列（标注当前项与上下文窗口），`/model` 查看
-  或切换（支持 `provider/model` 或裸模型名）
-- 一次性对话：`/ask [-m 模型] [-d 目录] [-t 标题] 提示词` 在新 session
-  中执行（可选临时模型覆盖，结束后恢复），完成时公布 session id；
-  `/say <会话ID> 提示词` 向指定会话发一条消息，两者都不影响当前绑定
-- 会话管理：`/sessions`（跨目录罗列）、`/switch`、`/new [-d 目录] [标题]`
-  （可指定工作目录，自动创建对应 workspace 与事件订阅）、
-  `/info`（目录、技能、工具、上下文水位）、`/export`（导出完整会话为
-  HTML）、`/status`、`/cancel`、`/help`
-- `RegisterCommand` 注册自定义命令（回调函数），可回复文字与文件
-- 每个 IM 会话绑定一个 Crush session；会话忙碌时新 prompt 自动排队
+- 可选自动拉起 `crush server`（`StartServer`，默认关闭，行为同 `crush client`），
+  `Stop()` 时回收子进程
+- 每轮回答完成后渲染自带样式的 HTML 文件发送：thinking、正文（完整
+  markdown：标题/表格/列表/引用/分割线/删除线/图片链接/自动链接）、
+  toolcall 与其 result（按 tool_call_id 配对在同一块内）；
+  `edit`/`write`/`multiedit` 渲染彩色 diff；`task`/`agent` 渲染输入、
+  子会话完整过程与输出，且不切换当前会话绑定
+- agent 调用 question tool 时：先发送当前进度的 HTML 文件，再发文字提问；
+  下一条非命令消息作为答案解析提交（序号/选项文本/yes-no/自由文本）
+- 模型管理：`/models`、`/model`；一次性对话 `/ask [-m 模型] [-d 目录]
+  [-t 标题]`（可选临时模型覆盖，结束恢复并公布 session id）；
+  `/say <会话ID> 提示词` 向指定会话单发（均不影响当前绑定）
+- 会话管理：`/sessions [关键词]`（跨目录聚合为带搜索框的 HTML 文件，避免 IM
+  截断；关键词服务端预过滤）、`/switch`、`/new [-d 目录] [标题]`、
+  `/info`（目录/技能/工具/上下文水位）、`/export`（HTML 导出）、
+  `/summarize`（手动压缩会话）、`/status`、`/cancel`、`/help`
+- 统一日志：`imwrap.SetLogger/SetLogLevel`，宿主用 `imwrap.Logger()`
+- JSON 配置文件：`imwrap.LoadConfig(paths...)` + `FileConfig.Apply`
+- `RegisterCommand` 注册自定义命令；每个 IM 会话绑定一个 Crush session，
+  忙碌时新 prompt 自动排队
 
 ```go
-w, _ := imwrap.New(imwrap.Config{Client: c, Adapter: myAdapter})
-_ = w.Start(ctx)
+cfg := imwrap.Config{Client: c, Adapter: myAdapter, SelfAccount: "bot@im"}
+if fileCfg, err := imwrap.LoadConfig("imwrap.json"); err == nil {
+    fileCfg.Apply(&cfg)
+}
+w, _ := imwrap.New(cfg)
+_ = w.Start(ctx)          // StartServer=true 时自动拉起 crush server
 defer w.Stop()
 
-// IM 收到消息时：
-_ = w.HandleMessage(ctx, imwrap.IMMessage{ChatID: chat, Text: text})
+// IM 收到消息时（框架自行过滤 bot 自身输出）：
+_ = w.HandleMessage(ctx, imwrap.IMMessage{ChatID: chat, ID: id, Sender: sender, Text: text})
 
 // 编程接口（同样被内置命令使用）：
 _ = w.AskOnce(ctx, chat, "快速看下这个问题", imwrap.AskOptions{Model: "openai/gpt-5"})
+_ = w.SummarizeSession(ctx, chat)
 models, _ := w.ListModels(ctx, chat)
 info, _ := w.GetSessionInfo(ctx, chat) // 目录/技能/工具/上下文水位
 ```

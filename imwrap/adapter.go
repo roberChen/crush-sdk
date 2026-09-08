@@ -40,11 +40,19 @@ type HistoryFetcher interface {
 type IMMessage struct {
 	// ChatID identifies the conversation the message belongs to.
 	ChatID string
+	// ID is the IM-side message identifier, when the host knows it.
+	// It enables exact self-output filtering: mark the bot's own
+	// message IDs with [Wrapper.MarkSelfMessage].
+	ID string
 	// Sender identifies the author within the IM (user display
-	// name, account, or ID).
+	// name, account, or ID). Compared against Config.SelfAccount.
 	Sender string
 	// Text is the plain-text body of the message.
 	Text string
 	// SentAt is when the message was sent; zero means unknown.
 	SentAt time.Time
+	// FromSelf lets the host declare the message as the bot's own
+	// output outright (some IM SDKs flag direction), bypassing the
+	// echo heuristics.
+	FromSelf bool
 }

@@ -1,47 +1,95 @@
-// Package imwrap wraps the crush-sdk client into a chat-oriented
-// controller suitable for driving Crush from IM (instant messaging)
-// software such as WhatsApp, Telegram, WeCom, Slack, or Lark bots.
+// Package imwrap is a chat framework over the crush-sdk client for
+// driving Crush from IM (instant messaging) software such as WeCom,
+// Lark, Slack, Telegram, or WhatsApp bots. The host program only
+// provides the IM integration ([IMAdapter], optionally
+// [HistoryFetcher]) plus custom commands; the framework owns
+// everything else: sessions, permissions, reporting, questions,
+// models, filtering, logging, and configuration.
 //
-// The host program implements [IMAdapter] (usually on top of the IM's
-// CLI: send-text, send-file, read-history) and forwards every incoming
-// IM message to [Wrapper.HandleMessage]. The wrapper then:
+// # Messaging scenarios
 //
-//   - parses the message, distinguishing commands ("/new", "/switch",
-//     custom commands) from agent prompts;
-//   - runs agent prompts on a per-conversation Crush session with
-//     permissions auto-granted (YOLO), acknowledging immediately;
-//   - when a turn completes, renders the full turn (thinking, tool
-//     calls, tool results, assistant text) to a self-contained HTML
-//     document and sends it as a file, plus a short text summary;
-//   - when the agent asks a question (question tool), sends the
-//     partial turn as an HTML file followed by a text message asking
-//     the question; the user's next non-command reply is parsed and
-//     submitted as the answer;
-//   - manages models ("/models", "/model");
-//   - runs one-shot conversations ("/ask", optionally with a model
-//     override and directory, reporting the session ID when done) and
-//     one-off prompts to a specific session ("/say") without touching
-//     the chat's session binding;
-//   - provides session management commands: list (across all known
-//     workspace directories), switch, create (optionally in a given
-//     directory), inspect (directory, skills, tools, context
-//     watermark), export the full conversation as HTML, cancel.
+// Two conversation layouts are supported, and the framework
+// distinguishes user input from the bot's own output before anything
+// else runs (see [Wrapper.HandleMessage] and [Wrapper.IsSelfOutput]):
 //
-// A minimal host program looks like:
+//   - Two accounts: the user and the bot are separate IM accounts.
+//     Set [Config.SelfAccount] to the bot's account; messages from it
+//     are dropped.
+//   - Shared account: the bot polls the conversation history under
+//     the same account, so its own output flows back into the feed.
+//     The framework records every text it sends and recognizes the
+//     echo (chat-scoped, time-windowed content match with a
+//     message-timestamp direction guard). When the host knows the IM
+//     message IDs of its own sends, [Wrapper.MarkSelfMessage] enables
+//     exact ID matching; [IMMessage.FromSelf] declares direction
+//     outright.
+//
+// # What the framework does
+//
+//   - Parses messages: the command prefix ("/" by default) marks
+//     commands; everything else becomes an agent prompt, acked
+//     immediately.
+//   - Runs prompts on a per-conversation Crush session with
+//     permissions auto-granted (YOLO): workspaces are created with
+//     the auto-approve flag and SSE permission requests are granted
+//     automatically (both opt-out via [Config.DisableYOLO] and
+//     [Config.DisableAutoGrant]).
+//   - Reports each completed turn as a self-contained HTML file:
+//     thinking, assistant text (full markdown: headings, tables with
+//     alignment, lists, quotes, rules, inline markup), tool calls
+//     paired with their results, colored diffs for edit/write/
+//     multiedit, and nested sub-agent transcripts plus labeled output
+//     for task/agent calls. Sub-agent sessions never steal the chat's
+//     binding.
+//   - Handles the question tool: sends the partial turn as HTML plus
+//     a text question; the next non-command reply is parsed (choice
+//     index or label, yes/no, free text, numbered lines for batches)
+//     and submitted.
+//   - Manages models ("/models", "/model"), one-shot conversations
+//     ("/ask" with optional model override and directory, reporting
+//     the session ID), and one-off prompts to a chosen session
+//     ("/say") without touching the chat binding.
+//   - Manages sessions: "/sessions" renders a searchable HTML listing
+//     across all known workspace directories ("/sessions <keyword>"
+//     pre-filters), "/switch", "/new" (optionally in another
+//     directory, transparently bringing up that workspace and its
+//     event loop), "/info" (directory, skills, tools, context
+//     watermark), "/export" (full conversation as HTML), "/summarize"
+//     (manual compaction), "/status", "/cancel", "/help".
+//   - Queues prompts while a session is busy; reconnects SSE streams
+//     with backoff; optionally starts a `crush server` child process
+//     when none is reachable ([Config.StartServer], default off) and
+//     stops it on [Wrapper.Stop].
+//   - Provides framework logging ([Logger], [SetLogger],
+//     [SetLogLevel]) and a JSON file config ([LoadConfig],
+//     [FileConfig.Apply]).
+//
+// # Host program
 //
 //	c, _ := client.DefaultClient("/repo")
-//	ad := myIMCLIAdapter{} // implements imwrap.IMAdapter via exec.Command
-//	w, _ := imwrap.New(imwrap.Config{Client: c, Adapter: ad})
-//	if err := w.Start(ctx); err != nil { ... }
+//
+//	cfg := imwrap.Config{Client: c, Adapter: myIMCLIAdapter{}, SelfAccount: "bot@im"}
+//	if fc, err := imwrap.LoadConfig("imwrap.json"); err == nil {
+//		fc.Apply(&cfg) // options only; Client/Adapter stay host-owned
+//	}
+//	imwrap.SetLogLevel(slog.LevelInfo) // shared logging
+//
+//	w, _ := imwrap.New(cfg)
+//	if err := w.Start(ctx); err != nil { ... } // autostarts server when cfg.StartServer
 //	defer w.Stop()
-//	// from the IM listener goroutine:
-//	_ = w.HandleMessage(ctx, imwrap.IMMessage{ChatID: chat, Text: text})
 //
-// Custom commands extend the builtin set:
+//	// From the IM listener: feed every message; the framework itself
+//	// filters the bot's own output.
+//	_ = w.HandleMessage(ctx, imwrap.IMMessage{ChatID: chat, ID: id, Sender: sender, Text: text})
 //
-//	_ = w.RegisterCommand("deploy", "run the deploy pipeline", func(ctx context.Context, cc imwrap.CommandContext) error {
-//		return cc.Reply(ctx, "deploying "+cc.ArgText)
-//	})
+//	// Custom commands extend the builtin set.
+//	_ = w.RegisterCommand("deploy", "run the deploy pipeline",
+//		func(ctx context.Context, cc imwrap.CommandContext) error {
+//			return cc.Reply(ctx, "deploying "+cc.ArgText)
+//		})
+//
+// The executable skeleton in examples/imhost shows a complete host
+// built on an imaginary "im-cli".
 package imwrap
 
 import (
@@ -49,6 +97,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -94,6 +143,40 @@ type Config struct {
 	// GrantAction is the action used for auto-grants. Defaults to
 	// proto.PermissionAllow (one-shot).
 	GrantAction proto.PermissionAction
+
+	// SelfAccount names the bot's own IM account (sender identifier).
+	// Messages whose Sender equals it are treated as the bot's own
+	// output and ignored. Use in the two-account scenario where user
+	// and bot are separate accounts.
+	SelfAccount string
+
+	// EchoWindow bounds how long self-sent texts are remembered for
+	// echo filtering in the shared-account scenario. Zero means 10
+	// minutes; negative disables content echo matching entirely.
+	EchoWindow time.Duration
+
+	// DisableEchoFilter turns off all self-output filtering (message
+	// IDs, sender account, and content echo).
+	DisableEchoFilter bool
+
+	// StartServer makes [Wrapper.Start] launch a `crush server`
+	// child process when the server is not already reachable, like
+	// `crush client` does. The child is terminated by [Wrapper.Stop].
+	// Autostart only works with the default per-user socket (i.e. a
+	// client built by crush.DefaultClient). Disabled by default.
+	StartServer bool
+
+	// ServerCommand is the command used for autostart. Defaults to
+	// "crush" (invoked as `crush server`).
+	ServerCommand string
+
+	// ServerStartTimeout bounds how long Start waits for the spawned
+	// server to become healthy. Zero means 15 seconds.
+	ServerStartTimeout time.Duration
+
+	// Logger is the slog logger the wrapper uses. Nil means the
+	// package logger ([Logger]/[SetLogger]).
+	Logger *slog.Logger
 }
 
 func (c *Config) setDefaults() {
@@ -105,6 +188,12 @@ func (c *Config) setDefaults() {
 	}
 	if c.GrantAction == "" {
 		c.GrantAction = proto.PermissionAllow
+	}
+	if c.ServerCommand == "" {
+		c.ServerCommand = "crush"
+	}
+	if c.ServerStartTimeout <= 0 {
+		c.ServerStartTimeout = 15 * time.Second
 	}
 }
 
@@ -124,12 +213,16 @@ type Wrapper struct {
 	cfg     Config
 	client  *crush.Client
 	adapter IMAdapter
+	log     *slog.Logger
+	echo    *echoTracker
 
 	wsID string // default workspace (client path)
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	serverCmd *exec.Cmd // non-nil when autostart spawned a server
 
 	mu         sync.Mutex
 	chats      map[string]*chatState
@@ -196,11 +289,16 @@ func New(cfg Config) (*Wrapper, error) {
 		cfg:     cfg,
 		client:  cfg.Client,
 		adapter: cfg.Adapter,
+		log:     cfg.Logger,
+		echo:    newEchoTracker(cfg.EchoWindow),
 		chats:   make(map[string]*chatState),
 		turns:   make(map[string]*turnCollector),
 		cmds:    make(map[string]*command),
 		loops:   make(map[string]bool),
 		runs:    make(map[string]*runState),
+	}
+	if w.log == nil {
+		w.log = Logger()
 	}
 	registerBuiltinCommands(w)
 	return w, nil
@@ -226,6 +324,11 @@ func (w *Wrapper) Adapter() IMAdapter {
 // loop. It returns once the subscription is established. Cancelling
 // ctx stops all loops; [Wrapper.Stop] does the same and waits.
 func (w *Wrapper) Start(ctx context.Context) error {
+	if w.cfg.StartServer {
+		if err := w.ensureServer(ctx); err != nil {
+			return err
+		}
+	}
 	wsID, err := w.resolveWorkspace(ctx, w.client.Path())
 	if err != nil {
 		return err
@@ -248,17 +351,28 @@ func (w *Wrapper) Start(ctx context.Context) error {
 }
 
 // Stop terminates all event loops and waits for in-flight handler
-// goroutines. It is safe to call more than once.
+// goroutines. It also stops a server process spawned by autostart.
+// It is safe to call more than once.
 func (w *Wrapper) Stop() {
 	w.mu.Lock()
 	cancel := w.cancel
 	w.cancel = nil
 	w.ctx = nil
+	cmd := w.serverCmd
+	w.serverCmd = nil
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	w.wg.Wait()
+	if cmd != nil && cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil {
+			w.log.Warn("imwrap: failed to stop spawned server", "error", err)
+			return
+		}
+		_ = cmd.Wait()
+		w.log.Info("imwrap: spawned server stopped")
+	}
 }
 
 // workspaceFor returns the workspace ID for a directory path,
@@ -416,7 +530,7 @@ func (w *Wrapper) eventLoop(wsID string, events <-chan any) {
 		delay := time.Second
 		next, subErr := w.client.SubscribeEvents(ctx, wsID)
 		if subErr != nil {
-			slog.Error("imwrap: resubscribing to events failed", "workspace", wsID, "error", subErr)
+			w.log.Error("imwrap: resubscribing to events failed", "workspace", wsID, "error", subErr)
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -464,11 +578,11 @@ func (w *Wrapper) onPermissionRequest(wsID string, req proto.PermissionRequest) 
 		})
 		switch {
 		case err != nil:
-			slog.Warn("imwrap: auto-grant failed", "tool", req.ToolName, "error", err)
+			w.log.Warn("imwrap: auto-grant failed", "tool", req.ToolName, "error", err)
 		case !resolved:
 			// Another subscriber resolved it first; not an error.
 		default:
-			slog.Debug("imwrap: auto-granted permission", "tool", req.ToolName)
+			w.log.Debug("imwrap: auto-granted permission", "tool", req.ToolName)
 		}
 	})
 }
