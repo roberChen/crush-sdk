@@ -105,6 +105,50 @@ func diffStats(lines []diffLine) (added, removed int) {
 	return added, removed
 }
 
+// parseUnifiedDiff converts `git diff` output into diff lines,
+// skipping file headers and rendering hunk headers as context
+// markers.
+func parseUnifiedDiff(text string) []diffLine {
+	var out []diffLine
+	for line := range strings.SplitSeq(text, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git"),
+			strings.HasPrefix(line, "index "),
+			strings.HasPrefix(line, "--- "),
+			strings.HasPrefix(line, "+++ "):
+			continue
+		case strings.HasPrefix(line, "@@"):
+			out = append(out, diffLine{op: diffCtx, text: line})
+		case strings.HasPrefix(line, "+"):
+			out = append(out, diffLine{op: diffAdd, text: line[1:]})
+		case strings.HasPrefix(line, "-"):
+			out = append(out, diffLine{op: diffDel, text: line[1:]})
+		default:
+			out = append(out, diffLine{op: diffCtx, text: line})
+		}
+	}
+	return out
+}
+
+// renderDiffLinesHTML writes a colored table for pre-parsed diff
+// lines.
+func renderDiffLinesHTML(b *strings.Builder, lines []diffLine) {
+	added, removed := diffStats(lines)
+	fmt.Fprintf(b, "<table class=\"diff\" data-add=\"%d\" data-del=\"%d\">", added, removed)
+	for _, l := range lines {
+		cls := "ctx"
+		marker := " "
+		switch l.op {
+		case diffDel:
+			cls, marker = "del", "-"
+		case diffAdd:
+			cls, marker = "add", "+"
+		}
+		fmt.Fprintf(b, "<tr class=\"%s\"><td class=\"marker\">%s</td><td>%s</td></tr>", cls, marker, esc(l.text))
+	}
+	b.WriteString("</table>")
+}
+
 // renderDiffHTML writes a colored unified-diff table.
 func renderDiffHTML(b *strings.Builder, oldText, newText string) {
 	lines := lineDiff(oldText, newText)

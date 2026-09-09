@@ -32,6 +32,7 @@ type turnRenderCtx struct {
 	subs    []SubAgentTranscript
 	results map[string]proto.ToolResult
 	shown   map[string]bool // toolCallID -> result rendered with its call
+	footer  *SessionFooter
 }
 
 // TurnHTMLOption customizes [RenderTurnHTML].
@@ -41,6 +42,12 @@ type TurnHTMLOption func(*turnRenderCtx)
 // They are consumed in order by the turn's task/agent tool calls.
 func WithSubAgents(subs []SubAgentTranscript) TurnHTMLOption {
 	return func(c *turnRenderCtx) { c.subs = subs }
+}
+
+// WithFooter appends the session status footer (title, directory,
+// model, context usage, git branch) to the rendered document.
+func WithFooter(f *SessionFooter) TurnHTMLOption {
+	return func(c *turnRenderCtx) { c.footer = f }
 }
 
 // RenderTurnHTML renders one completed (or in-progress) agent turn to
@@ -70,6 +77,7 @@ func RenderTurnHTML(prompt string, msgs []proto.Message, rc *proto.RunComplete, 
 	}
 	fmt.Fprintf(&b, "<p class=\"sub\">generated at %s</p></header>", esc(time.Now().Format("2006-01-02 15:04:05")))
 	renderMessages(&b, msgs, ctx)
+	renderFooterHTML(&b, ctx.footer)
 	b.WriteString(htmlPageEnd())
 	return []byte(b.String())
 }
@@ -130,9 +138,20 @@ func indexToolResults(msgs []proto.Message) map[string]proto.ToolResult {
 	return out
 }
 
+// renderMessage writes one message section. Parts render into a
+// scratch builder first: a message whose every part was consumed
+// elsewhere (tool results already shown with their calls) is skipped
+// entirely instead of leaving an empty "TOOL finished" shell behind.
 func renderMessage(b *strings.Builder, m *proto.Message, ctx *turnRenderCtx) {
-	fmt.Fprintf(b, "<section class=\"msg role-%s\">", esc(string(m.Role)))
+	parts := new(strings.Builder)
+	for _, part := range m.Parts {
+		renderPart(parts, part, ctx)
+	}
+	if parts.Len() == 0 {
+		return
+	}
 
+	fmt.Fprintf(b, "<section class=\"msg role-%s\">", esc(string(m.Role)))
 	fmt.Fprintf(b, "<div class=\"msg-head\"><span class=\"badge\">%s</span>", esc(string(m.Role)))
 	if m.Role == proto.Assistant && (m.Model != "" || m.Provider != "") {
 		fmt.Fprintf(b, "<span class=\"meta\">%s / %s</span>", esc(m.Provider), esc(m.Model))
@@ -144,55 +163,59 @@ func renderMessage(b *strings.Builder, m *proto.Message, ctx *turnRenderCtx) {
 		b.WriteString("<span class=\"meta\">summary</span>")
 	}
 	b.WriteString("</div>")
-
-	for _, part := range m.Parts {
-		switch p := part.(type) {
-		case proto.ReasoningContent:
-			if p.Thinking == "" && p.Signature == "" {
-				continue
-			}
-			fmt.Fprintf(b, "<details class=\"thinking\"><summary>💭 Thinking</summary><pre>%s</pre></details>", esc(p.Thinking))
-		case proto.TextContent:
-			if p.Text == "" {
-				continue
-			}
-			fmt.Fprintf(b, "<div class=\"text\">%s</div>", markdownish(p.Text))
-		case proto.ToolCall:
-			renderToolCall(b, p, ctx)
-		case proto.ToolResult:
-			if ctx != nil && ctx.shown[p.ToolCallID] {
-				// Already rendered together with its tool call.
-				continue
-			}
-			if ctx != nil {
-				ctx.shown[p.ToolCallID] = true
-			}
-			cls := "toolresult"
-			summary := "📤 " + p.Name
-			if p.IsError {
-				cls += " failed"
-				summary += " (error)"
-			}
-			fmt.Fprintf(b, "<details class=\"%s\"><summary>%s</summary>", cls, esc(summary))
-			renderResultBody(b, "结果", p)
-			b.WriteString("</details>")
-		case proto.Finish:
-			note := "finished: " + string(p.Reason)
-			if p.Message != "" {
-				note += " (" + p.Message + ")"
-			}
-			cls := "finish"
-			if p.Reason == proto.FinishReasonError || p.Reason == proto.FinishReasonCanceled {
-				cls += " failed"
-			}
-			fmt.Fprintf(b, "<div class=\"%s\">%s</div>", cls, esc(note))
-		case proto.ImageURLContent:
-			fmt.Fprintf(b, "<div class=\"text\">image: <a href=\"%s\" target=\"_blank\" rel=\"noreferrer\">%s</a></div>", esc(p.URL), esc(truncate(p.URL, 120)))
-		case proto.ShellCommand:
-			fmt.Fprintf(b, "<details class=\"toolcall\"><summary>⌨ %s (exit %d)</summary><pre class=\"code\">%s</pre></details>", esc(p.Command), p.ExitCode, esc(p.Output))
-		}
-	}
+	b.WriteString(parts.String())
 	b.WriteString("</section>")
+}
+
+// renderPart renders one content part; parts that produce nothing
+// (empty text, results already attached to their calls) write
+// nothing.
+func renderPart(b *strings.Builder, part proto.ContentPart, ctx *turnRenderCtx) {
+	switch p := part.(type) {
+	case proto.ReasoningContent:
+		if p.Thinking == "" && p.Signature == "" {
+			return
+		}
+		fmt.Fprintf(b, "<details class=\"thinking\"><summary>💭 Thinking</summary><pre>%s</pre></details>", esc(p.Thinking))
+	case proto.TextContent:
+		if p.Text == "" {
+			return
+		}
+		fmt.Fprintf(b, "<div class=\"text\">%s</div>", markdownish(p.Text))
+	case proto.ToolCall:
+		renderToolCall(b, p, ctx)
+	case proto.ToolResult:
+		if ctx != nil && ctx.shown[p.ToolCallID] {
+			// Already rendered together with its tool call.
+			return
+		}
+		if ctx != nil {
+			ctx.shown[p.ToolCallID] = true
+		}
+		cls := "toolresult"
+		summary := "📤 " + p.Name
+		if p.IsError {
+			cls += " failed"
+			summary += " (error)"
+		}
+		fmt.Fprintf(b, "<details class=\"%s\"><summary>%s</summary>", cls, esc(summary))
+		renderResultBody(b, "结果", p)
+		b.WriteString("</details>")
+	case proto.Finish:
+		note := "finished: " + string(p.Reason)
+		if p.Message != "" {
+			note += " (" + p.Message + ")"
+		}
+		cls := "finish"
+		if p.Reason == proto.FinishReasonError || p.Reason == proto.FinishReasonCanceled {
+			cls += " failed"
+		}
+		fmt.Fprintf(b, "<div class=\"%s\">%s</div>", cls, esc(note))
+	case proto.ImageURLContent:
+		fmt.Fprintf(b, "<div class=\"text\">image: <a href=\"%s\" target=\"_blank\" rel=\"noreferrer\">%s</a></div>", esc(p.URL), esc(truncate(p.URL, 120)))
+	case proto.ShellCommand:
+		fmt.Fprintf(b, "<details class=\"toolcall\"><summary>⌨ %s (exit %d)</summary><pre class=\"code\">%s</pre></details>", esc(p.Command), p.ExitCode, esc(p.Output))
+	}
 }
 
 // Tool-name groups for specialized rendering. The edit-family names
@@ -515,6 +538,16 @@ table.sessions th, table.sessions td { border: 1px solid #2c3340; padding: 4px 8
 table.sessions th { background: #171c26; color: #c7d0dd; font-weight: 600; white-space: nowrap; }
 table.sessions tbody tr:nth-child(odd) td { background: #12151d; }
 table.sessions tr.current td { background: #14202b; }
+footer.session-footer { border-top: 1px solid #262b36; margin-top: 16px; padding-top: 10px; }
+footer.session-footer .sf-title { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+table.sf { border-collapse: collapse; font-size: 12px; width: 100%; }
+table.sf td { border: 1px solid #232a36; padding: 3px 10px; }
+table.sf td:first-child { color: #8b93a3; white-space: nowrap; width: 1%; text-align: right; }
+.sf-bar { display: inline-block; vertical-align: middle; width: 120px; height: 8px;
+  margin-left: 8px; background: #0b0d12; border: 1px solid #262b36; border-radius: 4px; overflow: hidden; }
+.sf-bar > span { display: block; height: 100%; background: #43d9a3; }
+.sf-bar.high > span { background: #ffc46b; }
+.sf-bar.critical > span { background: #ff8080; }
 table.md { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: 100%; }
 table.md th, table.md td { border: 1px solid #2c3340; padding: 4px 10px; text-align: left; }
 table.md th { background: #171c26; color: #c7d0dd; font-weight: 600; }

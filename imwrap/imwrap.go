@@ -97,6 +97,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -394,6 +395,9 @@ func (w *Wrapper) resolveWorkspace(ctx context.Context, path string) (string, er
 		return "", fmt.Errorf("failed to resolve path %q: %w", path, err)
 	}
 	abs = filepath.Clean(abs)
+	if err := validateWorkspaceDir(abs); err != nil {
+		return "", err
+	}
 
 	w.mu.Lock()
 	if id, ok := w.workspaces[abs]; ok {
@@ -421,6 +425,21 @@ func (w *Wrapper) resolveWorkspace(ctx context.Context, path string) (string, er
 	}
 	w.rememberWorkspace(abs, created.ID)
 	return created.ID, nil
+}
+
+// validateWorkspaceDir checks that a workspace path exists and is a
+// directory before any session is bound to it, so typos in "/new -d"
+// or AskOptions.Dir fail fast with a clear message instead of
+// creating a workspace in a bogus location.
+func validateWorkspaceDir(abs string) error {
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("目录不可用 %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("路径不是目录: %s", abs)
+	}
+	return nil
 }
 
 func (w *Wrapper) rememberWorkspace(path, wsID string) {

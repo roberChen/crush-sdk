@@ -469,9 +469,10 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 			}
 		}
 		subs := w.subAgentTranscripts(ctx, run.wsID, rc.SessionID, msgs)
+		footer := w.collectFooter(ctx, run.wsID, rc.SessionID, len(queued))
 
 		name := fmt.Sprintf("crush-reply-%s.html", timestampSlug(now()))
-		html := RenderTurnHTML(prompt, msgs, &rc, WithSubAgents(subs))
+		html := RenderTurnHTML(prompt, msgs, &rc, WithSubAgents(subs), WithFooter(footer))
 		if err := w.sendFile(ctx, chatID, name, html); err != nil {
 			w.notifyError(chatID, "failed to send reply file", err)
 		}

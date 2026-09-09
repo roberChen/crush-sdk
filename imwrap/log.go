@@ -1,6 +1,8 @@
 package imwrap
 
 import (
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -50,3 +52,44 @@ func SetLogLevel(level slog.Level) {
 		Level: level,
 	}))
 }
+
+// SetLogFile routes the package logger to an append-only file (also
+// mirrored to stderr) at the given level. It lets FileConfig's
+// log_file option take over the whole program's log destination;
+// callers wanting only a file logger can use NewFileLogger.
+func SetLogFile(path string, level slog.Level) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file %s: %w", path, err)
+	}
+	multi := io.MultiWriter(os.Stderr, f)
+	logMu.Lock()
+	logDef = slog.New(slog.NewTextHandler(multi, &slog.HandlerOptions{Level: level}))
+	logMu.Unlock()
+	return nil
+}
+
+// NewFileLogger builds an independent logger writing to an
+// append-only file; use it for host-specific logs that should not
+// share the package logger.
+func NewFileLogger(path string, level slog.Level) (*slog.Logger, *os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open log file %s: %w", path, err)
+	}
+	return slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})), f, nil
+}
+
+// Debug logs at debug level through the package logger. Hosts use
+// these helpers (or Logger()) so every record flows through one
+// handler.
+func Debug(msg string, args ...any) { Logger().Debug(msg, args...) }
+
+// Info logs at info level through the package logger.
+func Info(msg string, args ...any) { Logger().Info(msg, args...) }
+
+// Warn logs at warn level through the package logger.
+func Warn(msg string, args ...any) { Logger().Warn(msg, args...) }
+
+// Error logs at error level through the package logger.
+func Error(msg string, args ...any) { Logger().Error(msg, args...) }

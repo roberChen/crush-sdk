@@ -102,8 +102,20 @@ c, err := client.NewClient("/path/to/project", "tcp", "127.0.0.1:8080")
   截断；关键词服务端预过滤）、`/switch`、`/new [-d 目录] [标题]`、
   `/info`（目录/技能/工具/上下文水位）、`/export`（HTML 导出）、
   `/summarize`（手动压缩会话）、`/status`、`/cancel`、`/help`
-- 统一日志：`imwrap.SetLogger/SetLogLevel`，宿主用 `imwrap.Logger()`
-- JSON 配置文件：`imwrap.LoadConfig(paths...)` + `FileConfig.Apply`
+- 每份 HTML 报告末尾附带会话状态栏（类似 crush 本体 sidebar）：会话标题、
+  目录、模型、上下文用量（进度条）、统计、git 分支与未提交数
+- `/git`：导出当前工作空间 git 状态（分支、变更文件、完整 diff）为 HTML，
+  附带会话状态栏
+- workspace 目录合法性校验（存在且为目录），`/new -d`、`/ask -d` 拼写错误
+  立即报错
+- 统一日志：`imwrap.SetLogger/SetLogLevel/SetLogFile`，宿主直接用包级
+  `imwrap.Debug/Info/Warn/Error` 记录日志，整个程序（含子进程输出）统一走
+  同一日志管道
+- JSON 配置文件：`imwrap.LoadConfig(paths...)` + `FileConfig.Apply`，支持
+  `log_file`（日志落盘）与 `extra`（宿主自定义配置节），可接管整个程序的
+  配置加载
+- 自动 summary 与 crush 本体一致：由服务端按上下文水位自动触发，SDK 会话
+  天然生效；`/summarize` 手动触发，`disable_auto_summarize` 配置可关闭
 - `RegisterCommand` 注册自定义命令；每个 IM 会话绑定一个 Crush session，
   忙碌时新 prompt 自动排队
 

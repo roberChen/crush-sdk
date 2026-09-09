@@ -59,8 +59,11 @@ func (c CommandContext) ReplyFile(ctx context.Context, filename string, content 
 
 // CommandInfo describes a registered command.
 type CommandInfo struct {
-	// Name is the command name without the prefix.
+	// Name is the primary command name without the prefix.
 	Name string
+	// Aliases are alternative names that invoke the same command
+	// (builtins only, e.g. "ls" for "sessions").
+	Aliases []string
 	// Description is a one-line usage summary.
 	Description string
 	// Builtin marks commands shipped with the wrapper.
@@ -103,27 +106,45 @@ func (w *Wrapper) UnregisterCommand(name string) error {
 }
 
 // Commands lists registered commands (builtins first, then customs
-// alphabetically).
+// alphabetically). Aliases are folded into their primary command's
+// entry instead of appearing as duplicates.
 func (w *Wrapper) Commands() []CommandInfo {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var out []CommandInfo
+	byPrimary := make(map[string]*CommandInfo)
+	var order []string
+	// First pass: primaries (map order is random, so aliases are
+	// folded in a second pass).
 	for _, cmd := range w.cmds {
-		if cmd.builtin {
-			out = append(out, CommandInfo{Name: cmd.name, Description: cmd.desc, Builtin: true})
+		if _, ok := byPrimary[cmd.name]; ok {
+			continue
+		}
+		info := CommandInfo{Name: cmd.name, Description: cmd.desc, Builtin: cmd.builtin}
+		byPrimary[cmd.name] = &info
+		order = append(order, cmd.name)
+	}
+	// Second pass: fold alias entries into their primary command.
+	for name, cmd := range w.cmds {
+		if cmd.builtin && cmd.name != name {
+			if primary, ok := byPrimary[cmd.name]; ok {
+				primary.Aliases = append(primary.Aliases, name)
+			}
 		}
 	}
-	var customs []string
-	for name := range w.cmds {
-		if !w.cmds[name].builtin {
-			customs = append(customs, name)
+
+	var builtins, customs []CommandInfo
+	for _, name := range order {
+		info := byPrimary[name]
+		sort.Strings(info.Aliases)
+		if info.Builtin {
+			builtins = append(builtins, *info)
+		} else {
+			customs = append(customs, *info)
 		}
 	}
-	sort.Strings(customs)
-	for _, name := range customs {
-		out = append(out, CommandInfo{Name: name, Description: w.cmds[name].desc})
-	}
-	return out
+	sort.Slice(builtins, func(i, j int) bool { return builtins[i].Name < builtins[j].Name })
+	sort.Slice(customs, func(i, j int) bool { return customs[i].Name < customs[j].Name })
+	return append(builtins, customs...)
 }
 
 // runCommand dispatches a parsed command message.
@@ -154,7 +175,11 @@ func (w *Wrapper) commandHelp() string {
 	prefix := w.cfg.CommandPrefix
 	var b strings.Builder
 	for _, ci := range w.Commands() {
-		fmt.Fprintf(&b, "%s%s - %s\n", prefix, ci.Name, ci.Description)
+		name := ci.Name
+		if len(ci.Aliases) > 0 {
+			name += " (" + strings.Join(ci.Aliases, ", ") + ")"
+		}
+		fmt.Fprintf(&b, "%s%s - %s\n", prefix, name, ci.Description)
 	}
 	return b.String()
 }
@@ -176,15 +201,26 @@ func registerBuiltinCommands(w *Wrapper) {
 		{"say", "向指定会话发一条消息 (/say <会话ID> 提示词)，不影响当前绑定", nil, cmdSay},
 		{"models", "列出可用模型", nil, cmdModels},
 		{"model", "查看或设置当前模型 (/model [provider/model])", nil, cmdModel},
+		{"git", "导出当前工作空间 git 状态与 diff 为 HTML", nil, cmdGit},
 		{"export", "导出当前会话完整记录为 HTML 文件", nil, cmdExport},
 		{"summarize", "手动压缩当前会话（生成摘要释放上下文）", nil, cmdSummarize},
 		{"status", "查看当前会话与任务状态", nil, cmdStatus},
 		{"cancel", "取消当前问题或正在执行的任务", nil, cmdCancel},
 	}
 	for _, b := range builtins {
+		if _, exists := w.cmds[b.name]; exists {
+			// Registration is defensive: a duplicate name is logged
+			// and skipped, never an overwrite and never a panic.
+			w.log.Warn("imwrap: builtin command already registered, skipping", "name", b.name)
+			continue
+		}
 		entry := &command{name: b.name, desc: b.desc, fn: b.fn, builtin: true, builtinAlt: b.alt}
 		w.cmds[b.name] = entry
 		for _, alt := range b.alt {
+			if _, exists := w.cmds[alt]; exists {
+				w.log.Warn("imwrap: builtin alias already registered, skipping", "alias", alt)
+				continue
+			}
 			w.cmds[alt] = entry
 		}
 	}
@@ -477,6 +513,10 @@ func (w *Wrapper) ExportSessionHTML(ctx context.Context, chatID string) error {
 
 func cmdExport(ctx context.Context, c CommandContext) error {
 	return c.W.ExportSessionHTML(ctx, c.ChatID)
+}
+
+func cmdGit(ctx context.Context, c CommandContext) error {
+	return c.W.ExportGitStatus(ctx, c.ChatID)
 }
 
 // SummarizeSession requests a manual summarization of the chat's

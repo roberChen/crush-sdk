@@ -104,7 +104,9 @@ func RenderSessionsHTML(summaries []SessionSummary, filter string) []byte {
 		fmt.Fprintf(&b, "（关键词 %s）", esc(filter))
 	}
 	fmt.Fprintf(&b, "，generated at %s</p>", esc(time.Now().Format("2006-01-02 15:04:05")))
-	b.WriteString("<input id=\"q\" class=\"search\" type=\"search\" placeholder=\"搜索：标题 / 会话ID / 目录 / 状态（当前、busy）\" autocomplete=\"off\">")
+	b.WriteString("<input id=\"q\" class=\"search\" type=\"search\" placeholder=\"搜索：标题 / 会话ID / 目录 / 状态（当前、busy）\" autocomplete=\"off\" oninput=\"imwrapFilter()\">")
+	b.WriteString("<span id=\"search-note\" class=\"sub\"></span>")
+	b.WriteString("<noscript><p class=\"warn\">当前查看器禁用了脚本，无法实时搜索；可在 IM 中使用 /sessions &lt;关键词&gt; 服务端过滤后重新导出。</p></noscript>")
 	b.WriteString("</header>")
 
 	b.WriteString("<main><table class=\"sessions\"><thead><tr><th>#</th><th>ID</th><th>标题</th><th>消息</th><th>tokens</th><th>费用</th><th>更新时间</th><th>目录</th><th>状态</th></tr></thead><tbody>")
@@ -168,21 +170,31 @@ func tokenPair(s SessionSummary) string {
 
 // sessionsSearchJS wires the search box to row filtering; it is
 // inline so the document stays self-contained.
+// sessionsSearchJS wires the search box to row filtering. It uses
+// only classic ES5 constructs (no NodeList.forEach, no arrow
+// functions) and a named global so the inline oninput fallback works
+// even where addEventListener is blocked; it stays inline so the
+// document is self-contained.
 const sessionsSearchJS = `<script>
+function imwrapFilter() {
+  var q = document.getElementById('q');
+  if (!q) return;
+  var v = q.value.trim().toLowerCase();
+  var rows = document.querySelectorAll('table.sessions tbody tr');
+  var shown = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var tr = rows[i];
+    var hay = tr.getAttribute('data-search') || '';
+    var hit = !v || hay.indexOf(v) !== -1;
+    tr.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  }
+  var note = document.getElementById('search-note');
+  if (note) note.textContent = v ? (shown + ' / ' + rows.length + ' 匹配') : '';
+}
 (function () {
   var q = document.getElementById('q');
   if (!q) return;
-  q.addEventListener('input', function () {
-    var v = q.value.trim().toLowerCase();
-    var rows = document.querySelectorAll('table.sessions tbody tr');
-    var shown = 0;
-    rows.forEach(function (tr) {
-      var hit = !v || (tr.getAttribute('data-search') || '').indexOf(v) !== -1;
-      tr.style.display = hit ? '' : 'none';
-      if (hit) shown++;
-    });
-    var note = document.getElementById('search-note');
-    if (note) note.textContent = v ? shown + ' / ' + rows.length + ' 匹配' : '';
-  });
-})();
-</script>`
+  q.addEventListener('input', imwrapFilter);
+  q.addEventListener('search', imwrapFilter);
+})();</script>`

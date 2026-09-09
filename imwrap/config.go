@@ -59,7 +59,17 @@ type FileConfig struct {
 	// LogLevel is one of debug, info, warn, error; applied to the
 	// package logger.
 	LogLevel string `json:"log_level,omitempty"`
+	// LogFile routes the package logger (wrapper, host, spawned
+	// server output) to an append-only file in addition to stderr.
+	LogFile string `json:"log_file,omitempty"`
+	// Extra carries host-program configuration sections untouched by
+	// the wrapper, so a single JSON file can configure the whole
+	// program: read your own keys here after LoadConfig.
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+// extraAlias exists so UnmarshalJSON can accept both "extra" and
+// arbitrary top-level sections; see FileConfig.UnmarshalJSON.
 
 // LoadConfig reads the first existing file among paths. It returns a
 // zero FileConfig with an os.ErrNotExist-wrapped error when none
@@ -114,6 +124,31 @@ func (f FileConfig) Apply(cfg *Config) {
 	if f.LogLevel != "" {
 		SetLogLevel(parseLogLevel(f.LogLevel))
 	}
+	if f.LogFile != "" {
+		if err := SetLogFile(f.LogFile, parseLogLevel(f.LogLevel)); err != nil {
+			// Config problems must not take the program down; the
+			// stderr logger keeps running.
+			Logger().Warn("imwrap: failed to apply log_file from config", "error", err)
+		}
+	}
+}
+
+// UnmarshalJSON decodes the file config and also captures the
+// host-reserved "extra" section.
+func (f *FileConfig) UnmarshalJSON(data []byte) error {
+	type alias FileConfig
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*f = FileConfig(a)
+	var probe struct {
+		Extra map[string]json.RawMessage `json:"extra"`
+	}
+	if err := json.Unmarshal(data, &probe); err == nil {
+		f.Extra = probe.Extra
+	}
+	return nil
 }
 
 // parseLogLevel maps a config string to a slog level, defaulting to

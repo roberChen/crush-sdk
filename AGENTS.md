@@ -158,7 +158,17 @@ everything else is framework-owned. Key invariants:
   probed first; a `crush server` child is spawned only when unreachable, its
   output piped into the wrapper logger, and `Stop()` kills it.
 - File config (`config.go`): `FileConfig` (JSON) -> `Apply(&Config)`; it never
-  provides Client/Adapter, only options. Unknown log levels fall back to info.
+  provides Client/Adapter, only options (plus `log_file` for file logging and
+  the host-reserved `extra` section for program config takeover). Unknown log
+  levels fall back to info. The two logger tests mutate the package logger and
+  must stay sequential (no t.Parallel).
+- Session reports and `/git` exports end with a sidebar-like footer
+  (`footer.go`: title, dir, model, context usage bar, git branch via local git
+  exec). Workspace dirs are validated (exists, is a dir) in resolveWorkspace.
+- Command listing folds aliases into their primary entry (two-pass: primaries
+  first, then aliases; map order is random). Builtin registration is
+  defensive: duplicates log a warning and are skipped, never overwriting and
+  never panicking; RegisterCommand cannot override builtins.
 - Turn correlation uses a fresh RunID per `SendMessage`; runs are tracked in
   `Wrapper.runs` keyed by RunID (`runState`). Attached runs own the chat's
   busy/queue slots; detached runs (`/ask` one-shots, `/say`) never touch the
