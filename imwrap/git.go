@@ -86,7 +86,9 @@ func RenderGitStatusHTML(g *GitStatus, footer *SessionFooter) []byte {
 	}
 	if strings.TrimSpace(g.Diff) != "" {
 		b.WriteString("<div class=\"hunk-head\">完整 diff（相对 HEAD，含已暂存）</div>")
-		renderDiffLinesHTML(&b, parseUnifiedDiff(g.Diff))
+		for _, f := range parseUnifiedDiffFiles(g.Diff) {
+			renderUnifiedFileHTML(&b, f)
+		}
 	}
 	b.WriteString("</main>")
 

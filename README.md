@@ -108,6 +108,12 @@ c, err := client.NewClient("/path/to/project", "tcp", "127.0.0.1:8080")
   附带会话状态栏
 - workspace 目录合法性校验（存在且为目录），`/new -d`、`/ask -d` 拼写错误
   立即报错
+- HTML 报告文件由框架管理生命周期：适配器实现 `FilePathSender` 时，框架将文件
+  写入专用临时目录（`html_dir` 可配置，默认系统临时目录下的 imwrap-html，
+  绝不落在程序运行目录），发送后立即删除；实现 `ContentFileSender` 的适配器
+  则直接接收字节。`IMAdapter` 只强制 `SendText`
+- diff 渲染支持**合并/并排双视图**（CSS checkbox 切换，无需 JS）：行号、
+  可见的 +/- 统计、行内字符级高亮、多文件分组与 @@ hunk 样式化
 - 统一日志：`imwrap.SetLogger/SetLogLevel/SetLogFile`，宿主直接用包级
   `imwrap.Debug/Info/Warn/Error` 记录日志，整个程序（含子进程输出）统一走
   同一日志管道

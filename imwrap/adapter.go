@@ -7,8 +7,11 @@ import (
 
 // IMAdapter bridges the wrapper to a concrete IM (instant messaging)
 // client. The host program implements it on top of whatever the IM
-// software offers, typically CLI commands for sending text, sending
-// files, and reading conversation history.
+// software offers, typically CLI commands for sending text and
+// files. Only SendText is mandatory; file sending is provided by
+// implementing either [ContentFileSender] (send bytes) or
+// [FilePathSender] (send a staged path, letting the wrapper own the
+// file lifecycle).
 //
 // All methods may be called concurrently; implementations must be safe
 // for concurrent use.
@@ -16,12 +19,29 @@ type IMAdapter interface {
 	// SendText sends a plain-text message to the conversation
 	// identified by chatID.
 	SendText(ctx context.Context, chatID, text string) error
+}
 
+// ContentFileSender is an optional interface for adapters whose IM
+// CLI accepts file contents directly.
+type ContentFileSender interface {
 	// SendFile sends a file to the conversation identified by
 	// chatID. content is the full file body; filename should carry
 	// an extension the IM can render (the wrapper sends HTML
 	// reports as filename ending in ".html").
 	SendFile(ctx context.Context, chatID, filename string, content []byte) error
+}
+
+// FilePathSender is an optional interface an IMAdapter implements
+// when its IM CLI sends files by path rather than by content. When
+// present, the wrapper takes over the file lifecycle: it writes the
+// HTML report to Config.HTMLDir (a dedicated temp directory, never
+// the program's working directory), passes the path to the adapter,
+// and deletes the file after the send completes.
+type FilePathSender interface {
+	// SendFilePath sends the file at path to the conversation. The
+	// file is owned by the wrapper and may be removed as soon as the
+	// call returns.
+	SendFilePath(ctx context.Context, chatID, filename, path string) error
 }
 
 // HistoryFetcher is an optional interface an IMAdapter can implement

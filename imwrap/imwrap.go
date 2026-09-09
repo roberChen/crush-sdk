@@ -178,6 +178,13 @@ type Config struct {
 	// Logger is the slog logger the wrapper uses. Nil means the
 	// package logger ([Logger]/[SetLogger]).
 	Logger *slog.Logger
+
+	// HTMLDir is the directory where the wrapper stages HTML report
+	// files for adapters implementing [FilePathSender]. Files are
+	// removed right after the send. Defaults to a dedicated
+	// "imwrap-html" folder under the system temp dir, never the
+	// program's working directory.
+	HTMLDir string
 }
 
 func (c *Config) setDefaults() {
@@ -195,6 +202,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.ServerStartTimeout <= 0 {
 		c.ServerStartTimeout = 15 * time.Second
+	}
+	if c.HTMLDir == "" {
+		c.HTMLDir = filepath.Join(os.TempDir(), "imwrap-html")
 	}
 }
 

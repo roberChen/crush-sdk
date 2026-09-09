@@ -165,6 +165,12 @@ everything else is framework-owned. Key invariants:
 - Session reports and `/git` exports end with a sidebar-like footer
   (`footer.go`: title, dir, model, context usage bar, git branch via local git
   exec). Workspace dirs are validated (exists, is a dir) in resolveWorkspace.
+- File lifecycle: adapters implementing `FilePathSender` get files staged
+  in `Config.HTMLDir` (default `<tmp>/imwrap-html`, never the working dir)
+  and deleted right after the send; `ContentFileSender` adapters receive
+  bytes. `IMAdapter` itself only requires SendText. `/help` output is
+  generated from Commands(), which folds aliases (two-pass scan) and is
+  asserted duplicate-free by TestHelpTextHasNoDuplicateLines.
 - Command listing folds aliases into their primary entry (two-pass: primaries
   first, then aliases; map order is random). Builtin registration is
   defensive: duplicates log a warning and are skipped, never overwriting and

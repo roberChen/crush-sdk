@@ -2,6 +2,7 @@ package imwrap
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -299,4 +300,102 @@ func TestFileConfigLogFileAndExtra(t *testing.T) {
 	data, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.Contains(t, string(data), "extra config test")
+}
+
+// pathAdapter implements FilePathSender; pathSends records what was
+// sent and the staged path.
+type pathAdapter struct {
+	fakeAdapter
+	htmlDir   string
+	pathSends []struct{ chatID, filename, path string }
+	fail      bool
+}
+
+func (p *pathAdapter) SendFilePath(_ context.Context, chatID, filename, path string) error {
+	p.pathSends = append(p.pathSends, struct{ chatID, filename, path string }{chatID, filename, path})
+	if p.fail {
+		return errors.New("send failed")
+	}
+	return nil
+}
+
+func TestSendFileStagesAndCleansUp(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeServer(t)
+	ad := &pathAdapter{htmlDir: t.TempDir()}
+	w, err := New(Config{Client: f.client(t), Adapter: ad, HTMLDir: ad.htmlDir})
+	require.NoError(t, err)
+	require.NoError(t, w.Start(context.Background()))
+	t.Cleanup(w.Stop)
+
+	require.NoError(t, w.sendFile(context.Background(), "c", "crush-reply-x.html", []byte("<html>hi</html>")))
+	require.Len(t, ad.pathSends, 1)
+	require.Equal(t, "crush-reply-x.html", ad.pathSends[0].filename)
+	// The staged file existed at send time and is gone afterwards.
+	staged := ad.pathSends[0].path
+	require.Equal(t, ad.htmlDir, filepath.Dir(staged))
+	data, err := os.ReadFile(staged)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_ = data
+
+	// Cleanup also happens when the send fails.
+	ad.fail = true
+	require.Error(t, w.sendFile(context.Background(), "c", "crush-reply-y.html", []byte("<html>2</html>")))
+	entries, err := os.ReadDir(ad.htmlDir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestSendFileFallsBackToContent(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeServer(t)
+	ad := &fakeAdapter{}
+	w, err := New(Config{Client: f.client(t), Adapter: ad})
+	require.NoError(t, err)
+	require.NoError(t, w.Start(context.Background()))
+	t.Cleanup(w.Stop)
+
+	// Content-based adapter: no staging directory is created.
+	require.NoError(t, w.sendFile(context.Background(), "c", "f.html", []byte("x")))
+	_, err = os.Stat(w.cfg.HTMLDir)
+	require.True(t, os.IsNotExist(err))
+}
+
+func TestHelpTextHasNoDuplicateLines(t *testing.T) {
+	t.Parallel()
+	w, _, _ := startWrapper(t)
+
+	seen := map[string]bool{}
+	for _, line := range strings.Split(w.commandHelp(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		require.False(t, seen[line], "duplicate help line: %s", line)
+		seen[line] = true
+	}
+	require.Contains(t, w.commandHelp(), "/help (?)")
+	require.Contains(t, w.commandHelp(), "/sessions (ls)")
+}
+
+// textOnlyAdapter implements only SendText.
+type textOnlyAdapter struct{}
+
+func (textOnlyAdapter) SendText(_ context.Context, _, _ string) error { return nil }
+
+func TestSendFileRequiresAFileSender(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeServer(t)
+	ad := &textOnlyAdapter{}
+	w, err := New(Config{Client: f.client(t), Adapter: ad})
+	require.NoError(t, err)
+	require.NoError(t, w.Start(context.Background()))
+	t.Cleanup(w.Stop)
+
+	err = w.sendFile(context.Background(), "c", "f.html", []byte("x"))
+	require.ErrorContains(t, err, "neither FilePathSender nor ContentFileSender")
+	// Text still works.
+	require.NoError(t, w.sendText(context.Background(), "c", "hello"))
 }

@@ -2,7 +2,10 @@ package imwrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -98,10 +101,34 @@ func (w *Wrapper) sendText(ctx context.Context, chatID, text string) error {
 	return err
 }
 
-// sendFile sends a file through the adapter. Filenames are recorded
-// for potential echo matching; file bodies are not.
+// sendFile sends a file through the adapter. When the adapter
+// implements [FilePathSender], the wrapper owns the file lifecycle:
+// content is staged in Config.HTMLDir, the path is handed to the
+// adapter, and the file is deleted after the send (success or
+// failure), so no HTML files accumulate anywhere. Content-based
+// adapters keep receiving the bytes directly and manage their own
+// temp files.
 func (w *Wrapper) sendFile(ctx context.Context, chatID, filename string, content []byte) error {
-	return w.adapter.SendFile(ctx, chatID, filename, content)
+	sender, ok := w.adapter.(FilePathSender)
+	if !ok {
+		contentSender, ok := w.adapter.(ContentFileSender)
+		if !ok {
+			return errors.New("adapter implements neither FilePathSender nor ContentFileSender")
+		}
+		return contentSender.SendFile(ctx, chatID, filename, content)
+	}
+	if err := os.MkdirAll(w.cfg.HTMLDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create html dir %s: %w", w.cfg.HTMLDir, err)
+	}
+	path := filepath.Join(w.cfg.HTMLDir, filename)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		return fmt.Errorf("failed to stage html file %s: %w", path, err)
+	}
+	sendErr := sender.SendFilePath(ctx, chatID, filename, path)
+	if rmErr := os.Remove(path); rmErr != nil {
+		w.log.Warn("imwrap: failed to remove staged html file", "path", path, "error", rmErr)
+	}
+	return sendErr
 }
 
 // notifyError reports an error to a chat and returns it.

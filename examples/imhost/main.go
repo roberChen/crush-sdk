@@ -7,7 +7,9 @@
 // The host only provides the IM adapter (and optional custom
 // commands); session management, permissions, reports, question
 // flows, model switching, and self-output filtering are handled by
-// the wrapper.
+// the wrapper. cliAdapter implements imwrap.FilePathSender, so the
+// wrapper stages HTML reports in its own temp dir and deletes them
+// after sending.
 //
 // Usage: go run ./examples/imhost [-config imwrap.json] [-path /project/dir]
 package main
@@ -18,9 +20,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,8 +28,8 @@ import (
 	"github.com/roberChen/crush-sdk/imwrap"
 )
 
-// cliAdapter implements imwrap.IMAdapter (and imwrap.HistoryFetcher)
-// on top of three imaginary CLI commands:
+// cliAdapter implements imwrap.IMAdapter, imwrap.FilePathSender, and
+// imwrap.HistoryFetcher on top of three imaginary CLI commands:
 //
 //	im-cli send-text  <chat> <text>
 //	im-cli send-file  <chat> <path>
@@ -40,11 +40,9 @@ func (cliAdapter) SendText(ctx context.Context, chatID, text string) error {
 	return runCLI(ctx, "send-text", chatID, text)
 }
 
-func (cliAdapter) SendFile(ctx context.Context, chatID, filename string, content []byte) error {
-	path, err := writeTemp(filename, content)
-	if err != nil {
-		return err
-	}
+// SendFilePath sends a file already staged by the wrapper; the file
+// is removed by the wrapper once this call returns.
+func (cliAdapter) SendFilePath(ctx context.Context, chatID, _, path string) error {
 	return runCLI(ctx, "send-file", chatID, path)
 }
 
@@ -66,8 +64,8 @@ func (cliAdapter) FetchHistory(ctx context.Context, chatID string, limit int) ([
 	return msgs, nil
 }
 
-// runCLI/outputCLI/writeTemp are small helpers; swap them for the
-// real process invocation details of your IM software.
+// runCLI/outputCLI are small helpers; swap them for the real process
+// invocation details of your IM software.
 func runCLI(ctx context.Context, args ...string) error {
 	cmd := exec.CommandContext(ctx, "im-cli", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -81,15 +79,6 @@ func outputCLI(ctx context.Context, args ...string) (string, error) {
 	return string(out), err
 }
 
-func writeTemp(filename string, content []byte) (string, error) {
-	dir, err := os.MkdirTemp("", "imwrap")
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, filename)
-	return path, os.WriteFile(path, content, 0o600)
-}
-
 func main() {
 	configPath := flag.String("config", "", "imwrap JSON config file (optional)")
 	path := flag.String("path", ".", "workspace filesystem path")
@@ -99,7 +88,8 @@ func main() {
 	defer cancel()
 
 	// Framework-owned logging: configure once here and use
-	// imwrap.Logger() everywhere else in the host program.
+	// imwrap.Logger() (or imwrap.Info etc.) everywhere else in the
+	// host program.
 	imwrap.SetLogLevel(slog.LevelInfo)
 	hostLog := imwrap.Logger()
 

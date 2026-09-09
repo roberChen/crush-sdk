@@ -62,6 +62,9 @@ type FileConfig struct {
 	// LogFile routes the package logger (wrapper, host, spawned
 	// server output) to an append-only file in addition to stderr.
 	LogFile string `json:"log_file,omitempty"`
+	// HTMLDir stages HTML report files for path-based IM adapters;
+	// defaults to a dedicated folder under the system temp dir.
+	HTMLDir string `json:"html_dir,omitempty"`
 	// Extra carries host-program configuration sections untouched by
 	// the wrapper, so a single JSON file can configure the whole
 	// program: read your own keys here after LoadConfig.
@@ -123,6 +126,9 @@ func (f FileConfig) Apply(cfg *Config) {
 	}
 	if f.LogLevel != "" {
 		SetLogLevel(parseLogLevel(f.LogLevel))
+	}
+	if f.HTMLDir != "" {
+		cfg.HTMLDir = f.HTMLDir
 	}
 	if f.LogFile != "" {
 		if err := SetLogFile(f.LogFile, parseLogLevel(f.LogLevel)); err != nil {
