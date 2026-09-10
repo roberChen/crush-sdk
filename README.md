@@ -104,8 +104,14 @@ c, err := client.NewClient("/path/to/project", "tcp", "127.0.0.1:8080")
   `/summarize`（手动压缩会话）、`/status`、`/cancel`、`/help`
 - 每份 HTML 报告末尾附带会话状态栏（类似 crush 本体 sidebar）：会话标题、
   目录、模型、上下文用量（进度条）、统计、git 分支与未提交数
-- `/git`：导出当前工作空间 git 状态（分支、变更文件、完整 diff）为 HTML，
-  附带会话状态栏
+- `/git` 命令族：无参=导出当前工作空间 git 状态（分支、变更文件、完整 diff）
+  为 HTML，附带会话状态栏；`/git log [n]` 最近 n 个提交（含各自 diff 与跨提交
+  合并视图）；`/git push [remote [分支]]`、`/git pull`、`/git checkout <分支>`
+  （无参列出本地分支）
+- 多 client 会话接管：会话被其他客户端（如 TUI）驱动时，`/status` 可见
+  session busy、bot 新 prompt 自动排队；该轮回合结束（即使非 bot 触发）同样
+  推送 HTML 报告并续跑排队消息
+- `/export` 导出的 HTML 末尾附带会话状态栏
 - workspace 目录合法性校验（存在且为目录），`/new -d`、`/ask -d` 拼写错误
   立即报错
 - HTML 报告文件由框架管理生命周期：适配器实现 `FilePathSender` 时，框架将文件

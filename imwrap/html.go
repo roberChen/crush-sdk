@@ -83,9 +83,14 @@ func RenderTurnHTML(prompt string, msgs []proto.Message, rc *proto.RunComplete, 
 }
 
 // RenderSessionHTML renders a whole session conversation (used by the
-// /export command) to a self-contained HTML document. sess may be nil
-// when session metadata is unavailable.
-func RenderSessionHTML(sess *proto.Session, msgs []proto.Message) []byte {
+// /export command) to a self-contained HTML document, optionally with
+// the session status footer. sess may be nil when session metadata is
+// unavailable.
+func RenderSessionHTML(sess *proto.Session, msgs []proto.Message, opts ...TurnHTMLOption) []byte {
+	ctx := &turnRenderCtx{}
+	for _, opt := range opts {
+		opt(ctx)
+	}
 	var b strings.Builder
 	b.WriteString(htmlPageStart())
 	b.WriteString("<header class=\"doc-header\"><h1>Crush 会话导出</h1>")
@@ -94,7 +99,8 @@ func RenderSessionHTML(sess *proto.Session, msgs []proto.Message) []byte {
 	}
 	fmt.Fprintf(&b, "<p class=\"sub\">%d messages, generated at %s</p></header>",
 		len(msgs), esc(time.Now().Format("2006-01-02 15:04:05")))
-	renderMessages(&b, msgs, &turnRenderCtx{})
+	renderMessages(&b, msgs, ctx)
+	renderFooterHTML(&b, ctx.footer)
 	b.WriteString(htmlPageEnd())
 	return []byte(b.String())
 }

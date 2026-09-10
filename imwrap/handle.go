@@ -174,6 +174,10 @@ func (w *Wrapper) ensureSession(ctx context.Context, chatID string) (sessionID, 
 	st = w.state(chatID)
 	st.sessionID = sess.ID
 	st.wsID = wsID
+	// Keep a collector alive for the bound session even before the
+	// bot runs anything, so turns driven by other clients (multi
+	// client setups) accumulate messages and can be reported.
+	w.turnFor(sess.ID)
 	w.mu.Unlock()
 	return sess.ID, wsID, nil
 }
@@ -201,6 +205,7 @@ func (w *Wrapper) CreateSession(ctx context.Context, chatID, dir, title string) 
 	st := w.state(chatID)
 	st.sessionID = sess.ID
 	st.wsID = wsID
+	w.turnFor(sess.ID)
 	w.mu.Unlock()
 	// Presence hint for other clients; ignore failures.
 	_ = w.client.SetCurrentSession(ctx, wsID, sess.ID)
@@ -213,11 +218,23 @@ func (w *Wrapper) CreateSession(ctx context.Context, chatID, dir, title string) 
 func (w *Wrapper) startAgentTurn(ctx context.Context, chatID, prompt string) error {
 	w.mu.Lock()
 	st := w.state(chatID)
+	sid, ws := st.sessionID, st.wsID
 	if st.busy {
 		st.queued = append(st.queued, prompt)
 		pos := len(st.queued)
 		w.mu.Unlock()
 		return w.sendText(ctx, chatID, fmt.Sprintf("⏳ 正在处理上一条消息，已加入队列（第 %d 位）。/cancel 可中止当前任务。", pos))
+	}
+	// The bot is idle, but the session may be busy because another
+	// client is driving it: the server would queue the prompt anyway,
+	// so mirror that in the chat UX.
+	if sid != "" {
+		if sess, gerr := w.client.GetSession(ctx, ws, sid); gerr == nil && sess.IsBusy {
+			st.queued = append(st.queued, prompt)
+			pos := len(st.queued)
+			w.mu.Unlock()
+			return w.sendText(ctx, chatID, fmt.Sprintf("⏳ 会话正忙（可能由其他客户端触发），已加入队列（第 %d 位）。/cancel 可中止当前任务。", pos))
+		}
 	}
 	// Tentatively claim the busy slot so concurrent senders cannot
 	// interleave; rolled back below on failure.
@@ -440,6 +457,8 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 	var (
 		run    *runState
 		queued []string
+		chatID string
+		wsID   string
 	)
 	if rc.RunID != "" {
 		run = w.runs[rc.RunID]
@@ -455,12 +474,24 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 			}
 		}
 	}
+	external := false
 	if run == nil {
-		// Not ours (another client's run) or already finalized.
-		w.mu.Unlock()
-		return
+		// The run was not triggered by this bot. When the session is
+		// bound to a chat (multi-client setup), adopt the completion:
+		// report the turn to that chat and drain any prompt the bot
+		// queued behind it.
+		chatID = w.chatForSession(rc.SessionID)
+		if chatID == "" {
+			w.mu.Unlock()
+			return
+		}
+		st := w.state(chatID)
+		wsID = st.wsID
+		queued = st.queued
+		st.queued = nil
+		external = true
 	}
-	if run.attached {
+	if !external && run.attached {
 		if st, ok := w.chats[run.chatID]; ok && st.runID == run.runID {
 			queued = st.queued
 			st.queued = nil
@@ -478,10 +509,23 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 		msgs = turn.snapshot()
 		prompt = turn.prompt
 	}
-	delete(w.turns, rc.SessionID)
+	if w.chatForSession(rc.SessionID) != "" {
+		// The session stays bound to a chat: keep a fresh collector
+		// so turns driven by other clients keep accumulating.
+		w.resetTurn(rc.SessionID)
+	} else {
+		delete(w.turns, rc.SessionID)
+	}
 	w.mu.Unlock()
 
-	chatID := run.chatID
+	if external {
+		run = &runState{chatID: chatID, wsID: wsID, sessionID: rc.SessionID}
+		if prompt == "" {
+			prompt = "（由其他客户端触发的回合）"
+		}
+	} else {
+		chatID = run.chatID
+	}
 	w.wg.Go(func() {
 		ctx, err := w.runCtx()
 		if err != nil {
@@ -517,7 +561,7 @@ func (w *Wrapper) onRunComplete(rc proto.RunComplete) {
 
 		w.restoreModel(ctx, run)
 
-		if run.attached && len(queued) > 0 {
+		if (run.attached || external) && len(queued) > 0 {
 			next := queued[0]
 			rest := queued[1:]
 			if err := w.startAgentTurn(ctx, chatID, next); err != nil {

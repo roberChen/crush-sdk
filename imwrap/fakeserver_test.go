@@ -255,6 +255,27 @@ func (f *fakeServer) pushSSE(payloadType string, event any) {
 }
 
 func (f *fakeServer) pushMessage(evt pubsub.EventType, m proto.Message) {
+	// The real server persists messages before broadcasting; mirror
+	// that so ListMessages fallbacks see streamed messages too.
+	f.mu.Lock()
+	for wsID, sessions := range f.sessions {
+		if _, ok := sessions[m.SessionID]; !ok {
+			continue
+		}
+		msgs := f.messages[wsID][m.SessionID]
+		replaced := false
+		for i := range msgs {
+			if msgs[i].ID == m.ID {
+				msgs[i] = m
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			f.messages[wsID][m.SessionID] = append(msgs, m)
+		}
+	}
+	f.mu.Unlock()
 	f.pushSSE(pubsub.PayloadTypeMessage, pubsub.Event[proto.Message]{Type: evt, Payload: m})
 }
 

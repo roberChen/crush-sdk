@@ -201,7 +201,7 @@ func registerBuiltinCommands(w *Wrapper) {
 		{"say", "向指定会话发一条消息 (/say <会话ID> 提示词)，不影响当前绑定", nil, cmdSay},
 		{"models", "列出可用模型", nil, cmdModels},
 		{"model", "查看或设置当前模型 (/model [provider/model])", nil, cmdModel},
-		{"git", "导出当前工作空间 git 状态与 diff 为 HTML", nil, cmdGit},
+		{"git", "git 操作：无参=导出状态与 diff；log [n]=最近提交及 diff；push/pull/checkout/branch", nil, cmdGit},
 		{"export", "导出当前会话完整记录为 HTML 文件", nil, cmdExport},
 		{"summarize", "手动压缩当前会话（生成摘要释放上下文）", nil, cmdSummarize},
 		{"status", "查看当前会话与任务状态", nil, cmdStatus},
@@ -303,6 +303,8 @@ func cmdSwitch(ctx context.Context, c CommandContext) error {
 	st := c.W.state(c.ChatID)
 	st.sessionID = target.sess.ID
 	st.wsID = target.wsID
+	// Eager collector so turns driven by other clients accumulate.
+	c.W.turnFor(target.sess.ID)
 	c.W.mu.Unlock()
 	// Presence hint for other clients; ignore failures.
 	_ = c.W.client.SetCurrentSession(ctx, target.wsID, target.sess.ID)
@@ -500,8 +502,9 @@ func (w *Wrapper) ExportSessionHTML(ctx context.Context, chatID string) error {
 	if s, err := w.client.GetSession(ctx, wsID, sessionID); err == nil {
 		sess = s
 	}
+	footer := w.collectFooter(ctx, wsID, sessionID, -1)
 	name := fmt.Sprintf("crush-session-%s-export-%s.html", shortID(sessionID), timestampSlug(now()))
-	if err := w.sendFile(ctx, chatID, name, RenderSessionHTML(sess, msgs)); err != nil {
+	if err := w.sendFile(ctx, chatID, name, RenderSessionHTML(sess, msgs, WithFooter(footer))); err != nil {
 		return err
 	}
 	title := ""
@@ -513,10 +516,6 @@ func (w *Wrapper) ExportSessionHTML(ctx context.Context, chatID string) error {
 
 func cmdExport(ctx context.Context, c CommandContext) error {
 	return c.W.ExportSessionHTML(ctx, c.ChatID)
-}
-
-func cmdGit(ctx context.Context, c CommandContext) error {
-	return c.W.ExportGitStatus(ctx, c.ChatID)
 }
 
 // SummarizeSession requests a manual summarization of the chat's
@@ -552,7 +551,15 @@ func cmdStatus(ctx context.Context, c CommandContext) error {
 	} else {
 		fmt.Fprintf(&b, "当前会话: %s（目录 %s）\n", shortID(sessionID), w.pathForWS(wsID))
 	}
-	fmt.Fprintf(&b, "任务进行中: %v\n", busy)
+	fmt.Fprintf(&b, "本 bot 任务进行中: %v\n", busy)
+	if sessionID != "" {
+		// Session-level busy is computed by the server across every
+		// client (including other frontends), so this reflects runs
+		// the bot did not trigger.
+		if sess, err := w.client.GetSession(ctx, wsID, sessionID); err == nil && sess.IsBusy {
+			fmt.Fprintf(&b, "会话状态: busy（任务进行中，可能由其他客户端触发）\n")
+		}
+	}
 	if runID != "" {
 		fmt.Fprintf(&b, "run: %s\n", shortID(runID))
 	}
